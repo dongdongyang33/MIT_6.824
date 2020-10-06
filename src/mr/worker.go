@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +20,12 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,7 +37,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -35,7 +47,109 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
+	arg := Empty{}
+	reply := AssignJobReply{}
 
+	call("Master.AssignJob", &arg, &reply)
+
+	switch reply.jobtype {
+
+	case 0:
+		log.Println("No job can be assigned.")
+		time.Sleep(1)
+
+	case 1:
+		log.Println("Assigned Map Job")
+		var content []byte
+		GetContent(reply.filename, &content)
+		kva := mapf(reply.filename, string(content))
+		intermediate := []KeyValue{}
+		intermediate = append(intermediate, kva...)
+		sort.Sort(ByKey(intermediate))
+		HandleIntermediate(reply.jobid, reply.nreduce, &intermediate)
+		jobdone := JobDoneArgs{reply.jobtype, reply.jobid}
+		call("Master.JobDone", &jobdone, &arg)
+
+	case 2:
+		log.Println("Assigned Reduce Job")
+
+		tmpfile, _ := ioutil.TempFile("tmpfile", "tmpFileName")
+		for i := 0; i < reply.nmap; i++ {
+			intermediateFileName := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.jobid)
+			ofile, _ := os.Open(intermediateFileName)
+			dec := json.NewDecoder(ofile)
+			var kva []KeyValue
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				kva = append(kva, kv)
+			}
+
+			idx := 0
+			for idx < len(kva) {
+				sameKeyIdx := idx + 1
+				for sameKeyIdx < len(kva) && kva[sameKeyIdx].Key == kva[idx].Key {
+					sameKeyIdx++
+				}
+				values := []string{}
+				for j := idx; j < sameKeyIdx; j++ {
+					values = append(values, kva[j].Value)
+				}
+				output := reducef(kva[idx].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(tmpfile, "%v %v\n", kva[idx].Key, output)
+
+				idx = sameKeyIdx
+			}
+		}
+		outputfilename := "mr-out-" + strconv.Itoa(reply.jobid)
+		os.Rename(tmpfile.Name(), outputfilename)
+
+	case 3: // TODO: need to change
+		log.Println("Fail to get respond from master. Exit!")
+		os.Exit(0)
+	}
+}
+
+func GetContent(filename string, content *[]byte) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	*content, err = ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+}
+
+func HandleIntermediate(jobid int, nreduce int, intermediate *[]KeyValue) {
+	files := make([]*os.File, nreduce)
+	var err error = nil
+	for i := 0; i < nreduce; i++ {
+		tmpFileName := "tmp-mr-reduce" + strconv.Itoa(i)
+		files[i], err = ioutil.TempFile("tmpfile", tmpFileName)
+		if err != nil {
+			log.Fatal("fail to create kv intermidiate file")
+		}
+	}
+
+	for i, kv := range *intermediate {
+		bucketid := ihash(kv.Key) % nreduce
+		enc := json.NewEncoder(files[bucketid])
+		err = enc.Encode((*intermediate)[i])
+		if err != nil {
+			log.Fatal("fail to encode kv intermidiate file [%v] ", files[bucketid])
+		}
+	}
+
+	for i := 0; i < nreduce; i++ {
+		finalName := "mr-" + strconv.Itoa(jobid) + "-" + strconv.Itoa(i)
+		os.Rename(files[i].Name(), finalName)
+	}
 }
 
 //
