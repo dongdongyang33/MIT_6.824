@@ -32,20 +32,21 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (m *Master) AssignJob(reply *AssignJobReply) error {
-	var ret error = nil
+func (m *Master) AssignJob(_ *Empty, reply *AssignJobReply) error {
+	ret := error(nil)
 	var timerid int
-	reply.jobtype = 0
+	reply.Jobtype = 0
 	if !CheckTaskStatus(&m.maptaskstatus) {
 		m.mux.Lock()
 		for num, status := range m.maptaskstatus {
 			if !status {
-				reply.jobtype = 1
-				reply.jobid = num
-				reply.nreduce = m.reducenum
-				reply.filename = m.filenumber[num]
+				reply.Jobtype = 1
+				reply.Jobid = num
+				reply.Nreduce = m.reducenum
+				reply.Filename = m.filenumber[num]
 				m.maptaskstatus[num] = true
 				timerid = num
+				break
 			}
 		}
 		m.mux.Unlock()
@@ -55,12 +56,13 @@ func (m *Master) AssignJob(reply *AssignJobReply) error {
 			m.mux.Lock()
 			for num, status := range m.reducetaskstatus {
 				if !status {
-					reply.jobtype = 2
-					reply.jobid = num
-					reply.nmap = m.mapnum
-					reply.nreduce = m.reducenum
+					reply.Jobtype = 2
+					reply.Jobid = num
+					reply.Nmap = m.mapnum
+					reply.Nreduce = m.reducenum
 					m.reducetaskstatus[num] = true
 					timerid = num
+					break
 				}
 			}
 			m.mux.Unlock()
@@ -71,6 +73,7 @@ func (m *Master) AssignJob(reply *AssignJobReply) error {
 }
 
 func CheckTaskStatus(task *map[int]bool) bool {
+	// empty = true
 	ret := false
 	if len(*task) == 0 {
 		ret = true
@@ -83,33 +86,37 @@ func TimeoutTimer(m *Master, jobtype int, jobid int) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
 	var status, present bool
-	var jobdetail string
 	if jobtype == 1 {
 		status, present = m.maptaskstatus[jobid]
-		jobdetail = "map"
 	} else {
 		status, present = m.reducetaskstatus[jobid]
-		jobdetail = "reduce"
 	}
 	if present {
 		if status {
-			log.Printf("Handle %v job file [%v] time out. Readd to task list.", jobdetail, m.filenumber[jobid])
 			if jobtype == 1 {
+				log.Printf("Handle map job file [%v] time out. Readd to task list.", m.filenumber[jobid])
 				m.maptaskstatus[jobid] = false
 			} else {
+				log.Printf("Handle reduce job %v file time out. Re-add to task list.", jobid)
 				m.reducetaskstatus[jobid] = false
 			}
 		}
 	}
 }
 
-func (m *Master) JobDone(arg *JobDoneArgs) error {
+func (m *Master) JobDone(arg *JobDoneArgs, _ *Empty) error {
 	var err error
-	if arg.jobtype == 1 {
+	if arg.Jobtype == 1 {
 		m.mux.Lock()
 		defer m.mux.Unlock()
-		log.Printf("Task file [%v] done. Romove from the task list.", m.filenumber[arg.jobid])
-		delete(m.maptaskstatus, arg.jobid)
+		log.Printf("Task file [%v] done. Romove from the task list.", m.filenumber[arg.Jobid])
+		delete(m.maptaskstatus, arg.Jobid)
+		err = nil
+	} else {
+		m.mux.Lock()
+		defer m.mux.Unlock()
+		log.Printf("Reduce Task [%v] done. Romove from the task list.", arg.Jobid)
+		delete(m.reducetaskstatus, arg.Jobid)
 		err = nil
 	}
 	return err
@@ -145,10 +152,15 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	m := Master{
+		mux:              new(sync.Mutex),
+		maptaskstatus:    make(map[int]bool),
+		reducetaskstatus: make(map[int]bool),
+	}
 	// Your code here.
 	m.reducenum = nReduce
-	for i, filename := range os.Args[2:] {
+	for i, filename := range os.Args[1:] {
+		log.Printf("add map task - %v\n", filename)
 		m.filenumber = append(m.filenumber, filename)
 		m.maptaskstatus[i] = false
 		m.mapnum++
@@ -157,6 +169,8 @@ func MakeMaster(files []string, nReduce int) *Master {
 	for i := 0; i < nReduce; i++ {
 		m.reducetaskstatus[i] = false
 	}
+	log.Printf("map task num: %v, reduce task num: %v\n", len(m.maptaskstatus), len(m.reducetaskstatus))
+	log.Println("init done")
 	m.server()
 	return &m
 }

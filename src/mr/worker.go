@@ -47,45 +47,51 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
-	arg := Empty{}
-	reply := AssignJobReply{}
+	for {
+		arg := Empty{}
+		reply := AssignJobReply{}
+		callret := call("Master.AssignJob", &arg, &reply)
+		if !callret {
+			log.Println("Exit!", callret)
+			os.Exit(0)
+		}
 
-	call("Master.AssignJob", &arg, &reply)
+		switch reply.Jobtype {
 
-	switch reply.jobtype {
+		case 0:
+			log.Println("No job can be assigned.")
 
-	case 0:
-		log.Println("No job can be assigned.")
-		time.Sleep(1)
+		case 1:
+			log.Println("Assigned Map Job")
+			var content []byte
+			GetContent(reply.Filename, &content)
+			kva := mapf(reply.Filename, string(content))
+			intermediate := []KeyValue{}
+			intermediate = append(intermediate, kva...)
+			sort.Sort(ByKey(intermediate))
+			HandleIntermediate(reply.Jobid, reply.Nreduce, &intermediate)
+			jobdone := JobDoneArgs{reply.Jobtype, reply.Jobid}
+			call("Master.JobDone", &jobdone, &arg)
 
-	case 1:
-		log.Println("Assigned Map Job")
-		var content []byte
-		GetContent(reply.filename, &content)
-		kva := mapf(reply.filename, string(content))
-		intermediate := []KeyValue{}
-		intermediate = append(intermediate, kva...)
-		sort.Sort(ByKey(intermediate))
-		HandleIntermediate(reply.jobid, reply.nreduce, &intermediate)
-		jobdone := JobDoneArgs{reply.jobtype, reply.jobid}
-		call("Master.JobDone", &jobdone, &arg)
+		case 2:
+			log.Println("Assigned Reduce Job")
 
-	case 2:
-		log.Println("Assigned Reduce Job")
-
-		tmpfile, _ := ioutil.TempFile("tmpfile", "tmpFileName")
-		for i := 0; i < reply.nmap; i++ {
-			intermediateFileName := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.jobid)
-			ofile, _ := os.Open(intermediateFileName)
-			dec := json.NewDecoder(ofile)
+			tmpfile, _ := ioutil.TempFile(".", "tmpFileName")
 			var kva []KeyValue
-			for {
-				var kv KeyValue
-				if err := dec.Decode(&kv); err != nil {
-					break
+			for i := 0; i < reply.Nmap; i++ {
+				intermediateFileName := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.Jobid)
+				ofile, _ := os.Open(intermediateFileName)
+				dec := json.NewDecoder(ofile)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
 				}
-				kva = append(kva, kv)
+				ofile.Close()
 			}
+			sort.Sort(ByKey(kva))
 
 			idx := 0
 			for idx < len(kva) {
@@ -104,13 +110,13 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				idx = sameKeyIdx
 			}
+			outputfilename := "mr-out-" + strconv.Itoa(reply.Jobid)
+			os.Rename(tmpfile.Name(), outputfilename)
+			tmpfile.Close()
+			jobdone := JobDoneArgs{reply.Jobtype, reply.Jobid}
+			call("Master.JobDone", &jobdone, &arg)
 		}
-		outputfilename := "mr-out-" + strconv.Itoa(reply.jobid)
-		os.Rename(tmpfile.Name(), outputfilename)
-
-	case 3: // TODO: need to change
-		log.Println("Fail to get respond from master. Exit!")
-		os.Exit(0)
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -128,12 +134,12 @@ func GetContent(filename string, content *[]byte) {
 
 func HandleIntermediate(jobid int, nreduce int, intermediate *[]KeyValue) {
 	files := make([]*os.File, nreduce)
-	var err error = nil
+	var err error
 	for i := 0; i < nreduce; i++ {
 		tmpFileName := "tmp-mr-reduce" + strconv.Itoa(i)
-		files[i], err = ioutil.TempFile("tmpfile", tmpFileName)
+		files[i], err = ioutil.TempFile(".", tmpFileName)
 		if err != nil {
-			log.Fatal("fail to create kv intermidiate file")
+			log.Fatalf("fail to create kv intermidiate file [%v]\n err - %v", tmpFileName, err)
 		}
 	}
 
@@ -142,13 +148,14 @@ func HandleIntermediate(jobid int, nreduce int, intermediate *[]KeyValue) {
 		enc := json.NewEncoder(files[bucketid])
 		err = enc.Encode((*intermediate)[i])
 		if err != nil {
-			log.Fatal("fail to encode kv intermidiate file [%v] ", files[bucketid])
+			log.Fatalf("fail to encode kv intermidiate file [%v] ", files[bucketid])
 		}
 	}
 
 	for i := 0; i < nreduce; i++ {
 		finalName := "mr-" + strconv.Itoa(jobid) + "-" + strconv.Itoa(i)
 		os.Rename(files[i].Name(), finalName)
+		files[i].Close()
 	}
 }
 

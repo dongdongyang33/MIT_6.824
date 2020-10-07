@@ -17,16 +17,16 @@ import (
 //
 
 type AssignJobReply struct {
-	jobtype  int // 0: waiting, 1: map, 2: reduce, 3: close
-	jobid    int
-	nmap     int
-	nreduce  int
-	filename string
+	Jobtype  int // 0: waiting, 1: map, 2: reduce
+	Jobid    int
+	Nmap     int
+	Nreduce  int
+	Filename string
 }
 
 type JobDoneArgs struct {
-	jobtype int // 1: map, 2: reduce
-	jobid   int
+	Jobtype int // 1: map, 2: reduce
+	Jobid   int
 }
 
 type Empty struct{}
