@@ -54,6 +54,17 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	// 2A:
+	term int
+	votefor int
+
+	// addtional para
+	majority int
+	role int
+	notifyCh chan int
+	applyNotifyCh chan int
+	applyCh chan ApplyMsg
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -66,6 +77,14 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.term
+	if rf.role == 2 {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	return term, isleader
 }
 
@@ -117,6 +136,9 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	// 2A
+	Term int
+	CandidateId int
 }
 
 //
@@ -125,13 +147,29 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	GrantVote bool
+	CurrentTerm int
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// how you rely the RPC when you recieve the request
 	// Your code here (2A, 2B).
+
+	// 2A
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.term = rf.term
+	reply.grantVote = false
+	if args.term > rf.term || ( args.term == rf.term && rf.votefor == -1){
+		rf.term = args.term
+		rf.votefor = args.candidateId
+		reply.grantVote = true
+	}
+
+	// 2B
 }
 
 //
@@ -166,6 +204,53 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+
+func (rf *Raft) sendAllPeerRequestVote() {
+	count := 0
+	success := false
+	var wg sync.WaitGroup
+	peerNum = len(rf.peers)
+	wg.Add(peerNum)
+	rf.mu.Lock()
+	args := RequestVoteArgs {
+		Term: rf.term
+		CandidateId: rf.me
+	}
+	rf.mu.Unlock()
+
+	for i := 0; i < peerNum; i++ {
+		go sendAndCalculateResult(i, &args, &count, &wg)
+	}
+
+	for {
+		rf.mu.Lock()
+		if 
+	}
+	wg.Wait()
+	rf.mu.Lock()
+	if rf.role == 1 && count >= rf.majority {
+		rf.role == 2
+		// send hearbeat immidiately
+	} 
+}
+
+func (rf *Raft) sendAndCalculateResult(serverid int, args *RequestVoteReply, count *int, wg *sync.WaitGroup){
+	reply := RequestVoteReply{}
+	ok := sendRequestVote(serverid, &args, &reply)
+	if ok {
+		if reply.grantVote {
+			atomic.AddInt32(&count, 1)
+		} else {
+			rf.mu.Lock()
+			if reply.CurrentTerm > rf.term {
+				rf.term = reply.currentTerm
+				rf.role = 0
+			}
+			rf.mu.Unlock()
+		}
+	}
+	wg.Done()
 }
 
 
@@ -234,10 +319,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A 
+	rf.term = 0
+	rf.votefor = -1
+
+	//additional para
+	rf.majority = len(rf.peers) / 2 + 1
+	rf.role = 0
+	rf.applyCh = applyCh
+	rf.notifyCh = make(chan int, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	go rf.applyRoutine()
+	go rf.timerRoutine()
 
 	return rf
+}
+
+func (rf *Raft) timerRoutine() {
+	tick := 10
+	
+
+}
+
+go (rf *Raft) applyRoutine() {
+	for{
+		select{
+		case commitIndex := <- rf.applyNotifyCh
+			if (commitIndex > rf.appliedIndex) {
+				for i := rf.appliedIndex + 1; i <= commitIndex; i++ {
+					rf.applyCh <- rf.log[i].ApplyMsg
+				}
+			}
+		}
+	}
 }
