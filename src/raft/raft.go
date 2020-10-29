@@ -60,6 +60,7 @@ type Raft struct {
 
 	// addtional para
 	majority int
+	timeoutCounter int
 	role int
 	notifyCh chan int
 	applyNotifyCh chan int
@@ -127,7 +128,51 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+type AppendEntriesArgs struct {
+	// 2A
+	term int
+	leaderid int 
 
+}
+
+type AppendEntriesReply struct {
+	term int
+	success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// 2A
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.term = rf.term
+	reply.success = false
+	if args.term > rf.term {
+		rf.role = 0
+		rf.term = args.term
+		rf.votefor = args.leaderid // ?
+		reply.success = true
+	}
+	// TODO: refresh election timeout timer
+	// TODO:
+}
+
+func (rf *Raft) electionTimeoutTimer(){
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	timeout := r.int31n(250) + 150
+	rf.timeoutCounter = 0
+	for {
+		atomic.AddInt32(&rf.timeoutCounter, 10)
+		time.sleep(10 * time.Millisecond)
+		current := atomic.LoadInt32(&rf.timeoutCounter)
+		if current == 0 {
+			timeout = r.int31n(250) + 150
+		} else {
+			if current > timeout {
+				// notify the routine to begin election
+			}
+		}
+	}
+}
 
 
 //
@@ -206,12 +251,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendAllPeerRequestVote() {
-	count := 0
+func (rf *Raft) sendAllPeerRequestVote() bool {
+	count := 1
 	success := false
-	var wg sync.WaitGroup
-	peerNum = len(rf.peers)
-	wg.Add(peerNum)
 	rf.mu.Lock()
 	args := RequestVoteArgs {
 		Term: rf.term
@@ -219,23 +261,32 @@ func (rf *Raft) sendAllPeerRequestVote() {
 	}
 	rf.mu.Unlock()
 
-	for i := 0; i < peerNum; i++ {
-		go sendAndCalculateResult(i, &args, &count, &wg)
+	for i, _ := range rf.peers {
+		go sendAndHandleVoteResult(i, &args, &count)
 	}
 
+	ret := false
 	for {
 		rf.mu.Lock()
-		if 
+		role := rf.role
+		rf.mu.Unlock()
+		if role != 1 {
+			break;
+		} else {
+			if count >= rf.majority{
+				rf.mu.Lock()
+				rf.role == 2
+				rf.mu.Unlock()
+				ret = true
+				break
+			}
+		}
 	}
-	wg.Wait()
-	rf.mu.Lock()
-	if rf.role == 1 && count >= rf.majority {
-		rf.role == 2
-		// send hearbeat immidiately
-	} 
+	
+	return ret
 }
 
-func (rf *Raft) sendAndCalculateResult(serverid int, args *RequestVoteReply, count *int, wg *sync.WaitGroup){
+func (rf *Raft) sendAndHandleVoteResult(serverid int, args *RequestVoteReply, count *int){
 	reply := RequestVoteReply{}
 	ok := sendRequestVote(serverid, &args, &reply)
 	if ok {
@@ -250,7 +301,6 @@ func (rf *Raft) sendAndCalculateResult(serverid int, args *RequestVoteReply, cou
 			rf.mu.Unlock()
 		}
 	}
-	wg.Done()
 }
 
 
@@ -331,27 +381,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	go rf.applyRoutine()
-	go rf.timerRoutine()
+
+	go rf.raftRoutine()
 
 	return rf
 }
 
-func (rf *Raft) timerRoutine() {
-	tick := 10
-	
+func (rf *Raft) raftRoutine() {
 
-}
-
-go (rf *Raft) applyRoutine() {
-	for{
-		select{
-		case commitIndex := <- rf.applyNotifyCh
-			if (commitIndex > rf.appliedIndex) {
-				for i := rf.appliedIndex + 1; i <= commitIndex; i++ {
-					rf.applyCh <- rf.log[i].ApplyMsg
-				}
-			}
-		}
-	}
 }
