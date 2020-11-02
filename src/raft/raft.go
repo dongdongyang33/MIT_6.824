@@ -17,14 +17,18 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"log"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -54,6 +58,17 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+	// 2A
+	term    int
+	votefor int
+
+	//additional para
+	role             int
+	majority         int
+	timeoutCounter   int32
+	heartbeatCounter int32
+	notifyCh         chan int
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -65,6 +80,14 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.term
+	if rf.role == 2 {
+		isleader = true
+	} else {
+		isleader = false
+	}
 	// Your code here (2A).
 	return term, isleader
 }
@@ -84,7 +107,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -108,15 +130,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	// 2A
+	Term        int
+	Candidateid int
 }
 
 //
@@ -125,6 +147,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term      int
+	GrantVote bool
 }
 
 //
@@ -132,6 +156,18 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	// 2A
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.GrantVote = false
+	reply.Term = rf.term
+	if rf.term < args.Term || (rf.term == args.Term && rf.votefor == -1) {
+		log.Printf("[server %v] vote for server %v", rf.me, args.Candidateid)
+		reply.GrantVote = true
+		rf.term = args.Term
+		rf.votefor = args.Candidateid
+		rf.role = 0
+	}
 }
 
 //
@@ -168,6 +204,134 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) beginElection() {
+	rf.mu.Lock()
+	if rf.role == 2 {
+		rf.mu.Unlock()
+		return
+	}
+	rf.role = 1
+	rf.term += 1
+	rf.votefor = rf.me
+	log.Printf("[server %v] Timeout. Begin election with term %v", rf.me, rf.term)
+	args := RequestVoteArgs{
+		Term:        rf.term,
+		Candidateid: rf.me,
+	}
+	rf.mu.Unlock()
+
+	var count int32
+	count = 1
+	for i, _ := range rf.peers {
+		go rf.sendAndHandleRequestVote(i, &args, &count)
+	}
+
+	for {
+		rf.mu.Lock()
+		if rf.role != 1 || rf.term != args.Term {
+			rf.mu.Unlock()
+			break
+		} else {
+			currentCount := atomic.LoadInt32(&count)
+			if currentCount >= int32(rf.majority) {
+				log.Printf("[server %v] become leader with term %v", rf.me, rf.term)
+				rf.role = 2
+				rf.mu.Unlock()
+				rf.notifyCh <- 1
+				break
+			}
+		}
+		rf.mu.Unlock()
+	}
+
+}
+
+func (rf *Raft) sendAndHandleRequestVote(serverid int, args *RequestVoteArgs, count *int32) {
+	reply := RequestVoteReply{}
+	ok := rf.peers[serverid].Call("Raft.RequestVote", args, &reply)
+	if ok {
+		if reply.GrantVote {
+			atomic.AddInt32(count, 1)
+		} else {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Term > rf.term {
+				rf.term = reply.Term
+				rf.role = 0
+				// TODO: change votefor or not
+				// Answer: no. the server can send VoteRequest to anyone include follower & candidate
+				// so you can't update the votefor
+			}
+			atomic.StoreInt32(&rf.timeoutCounter, 0)
+		}
+	}
+}
+
+type AppendEntriesArgs struct {
+	// 2A
+	Term     int
+	Leaderid int
+}
+
+type AppendEntriesReply struct {
+	Success bool
+	Term    int
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// 2A
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.term
+	if rf.term > args.Term {
+		reply.Success = false
+	} else {
+		reply.Success = true
+		if rf.term < args.Term {
+			rf.term = args.Term
+			rf.role = 0
+			// TODO: whether update votefor ot not
+			rf.votefor = args.Leaderid
+			atomic.StoreInt32(&rf.timeoutCounter, 0)
+			log.Printf("[server %v] become follower with term %v by receive RPC from server %v", rf.me, rf.term, args.Leaderid)
+		}
+	}
+}
+
+func (rf *Raft) startSendHeartbeat() {
+	// 2A
+	rf.mu.Lock()
+	if rf.role != 2 {
+		rf.mu.Unlock()
+		return
+	}
+	args := AppendEntriesArgs{}
+	args.Term = rf.term
+	args.Leaderid = rf.me
+	log.Printf("[server %v] send hearbeat (term %v)", rf.me, rf.term)
+	rf.mu.Unlock()
+	for i, _ := range rf.peers {
+		go rf.sendAndHandleAppendEntries(i, &args)
+	}
+
+}
+
+func (rf *Raft) sendAndHandleAppendEntries(serverid int, args *AppendEntriesArgs) {
+	// 2A - hearbeat
+	reply := AppendEntriesReply{}
+	ok := rf.peers[serverid].Call("Raft.AppendEntries", args, &reply)
+	if ok {
+		if !reply.Success {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.term < reply.Term {
+				rf.term = reply.Term
+				rf.role = 0
+				log.Printf("[server %v] become follower with term %v", rf.me, rf.term)
+			}
+		}
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -189,7 +353,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -234,10 +397,67 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A
+	rf.term = 0
+	rf.votefor = -1
+
+	// addition parameter
+	rf.role = 0
+	rf.majority = len(rf.peers)/2 + 1
+	rf.timeoutCounter = 0
+	rf.notifyCh = make(chan int, 100)
 
 	// initialize from state persisted before a crash
+	// will recovery the need-persistent parameter
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.raftRoutine()
 
 	return rf
+}
+
+func (rf *Raft) raftRoutine() {
+	go rf.elecionTimer()
+	go rf.heartbeatTimer()
+	log.Printf("[server %v] timer init done", rf.me)
+	for {
+		select {
+		case event := <-rf.notifyCh:
+			switch event {
+			case 0:
+				// election timeout and begin an election
+				go rf.beginElection()
+			case 1:
+				// 2A - heartbeat
+				go rf.startSendHeartbeat()
+			}
+		}
+	}
+}
+
+func (rf *Raft) elecionTimer() {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	timeout := r.Int31n(150) + 250
+	for {
+		atomic.AddInt32(&rf.timeoutCounter, 20)
+		time.Sleep(20 * time.Millisecond)
+		current := atomic.LoadInt32(&rf.timeoutCounter)
+		if current >= timeout {
+			timeout = r.Int31n(150) + 200
+			atomic.StoreInt32(&rf.timeoutCounter, 0)
+			rf.notifyCh <- 0
+		}
+	}
+}
+
+func (rf *Raft) heartbeatTimer() {
+	for {
+		atomic.AddInt32(&rf.heartbeatCounter, 20)
+		time.Sleep(20 * time.Millisecond)
+		current := atomic.LoadInt32(&rf.heartbeatCounter)
+		if current >= 100 {
+			atomic.StoreInt32(&rf.heartbeatCounter, 0)
+			rf.notifyCh <- 1
+		}
+	}
 }
