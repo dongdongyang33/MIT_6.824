@@ -167,6 +167,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.term = args.Term
 		rf.votefor = args.Candidateid
 		rf.role = 0
+		atomic.StoreInt32(&rf.timeoutCounter, 0)
 	}
 }
 
@@ -223,7 +224,9 @@ func (rf *Raft) beginElection() {
 	var count int32
 	count = 1
 	for i, _ := range rf.peers {
-		go rf.sendAndHandleRequestVote(i, &args, &count)
+		if i != rf.me {
+			go rf.sendAndHandleRequestVote(i, &args, &count)
+		}
 	}
 
 	for {
@@ -258,6 +261,7 @@ func (rf *Raft) sendAndHandleRequestVote(serverid int, args *RequestVoteArgs, co
 			if reply.Term > rf.term {
 				rf.term = reply.Term
 				rf.role = 0
+				log.Printf("[server %v] become follower with term %v by receiving VoteReqyest reply", rf.me, rf.term)
 				// TODO: change votefor or not
 				// Answer: no. the server can send VoteRequest to anyone include follower & candidate
 				// so you can't update the votefor
@@ -287,14 +291,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	} else {
 		reply.Success = true
-		if rf.term < args.Term {
-			rf.term = args.Term
-			rf.role = 0
-			// TODO: whether update votefor ot not
-			rf.votefor = args.Leaderid
-			atomic.StoreInt32(&rf.timeoutCounter, 0)
-			log.Printf("[server %v] become follower with term %v by receive RPC from server %v", rf.me, rf.term, args.Leaderid)
-		}
+		rf.term = args.Term
+		rf.role = 0
+		rf.votefor = args.Leaderid
+		log.Printf("[server %v] become/keep as follower with term %v by receive RPC from server %v", rf.me, rf.term, args.Leaderid)
+		atomic.StoreInt32(&rf.timeoutCounter, 0)
 	}
 }
 
@@ -311,7 +312,9 @@ func (rf *Raft) startSendHeartbeat() {
 	log.Printf("[server %v] send hearbeat (term %v)", rf.me, rf.term)
 	rf.mu.Unlock()
 	for i, _ := range rf.peers {
-		go rf.sendAndHandleAppendEntries(i, &args)
+		if i != rf.me {
+			go rf.sendAndHandleAppendEntries(i, &args)
+		}
 	}
 
 }
@@ -327,7 +330,7 @@ func (rf *Raft) sendAndHandleAppendEntries(serverid int, args *AppendEntriesArgs
 			if rf.term < reply.Term {
 				rf.term = reply.Term
 				rf.role = 0
-				log.Printf("[server %v] become follower with term %v", rf.me, rf.term)
+				log.Printf("[server %v] become follower with term %v by receiving AppendEntries reply", rf.me, rf.term)
 			}
 		}
 	}
@@ -371,6 +374,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+
 }
 
 func (rf *Raft) killed() bool {
@@ -439,10 +443,11 @@ func (rf *Raft) elecionTimer() {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	timeout := r.Int31n(150) + 250
 	for {
-		atomic.AddInt32(&rf.timeoutCounter, 20)
-		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&rf.timeoutCounter, 10)
+		time.Sleep(10 * time.Millisecond)
 		current := atomic.LoadInt32(&rf.timeoutCounter)
 		if current >= timeout {
+			log.Printf("[server %v] election timeout. put message into notifyCh", rf.me)
 			timeout = r.Int31n(150) + 200
 			atomic.StoreInt32(&rf.timeoutCounter, 0)
 			rf.notifyCh <- 0
@@ -452,10 +457,11 @@ func (rf *Raft) elecionTimer() {
 
 func (rf *Raft) heartbeatTimer() {
 	for {
-		atomic.AddInt32(&rf.heartbeatCounter, 20)
-		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&rf.heartbeatCounter, 10)
+		time.Sleep(10 * time.Millisecond)
 		current := atomic.LoadInt32(&rf.heartbeatCounter)
 		if current >= 100 {
+			log.Printf("[server %v] heartbeat timeout. put message into notifyCh", rf.me)
 			atomic.StoreInt32(&rf.heartbeatCounter, 0)
 			rf.notifyCh <- 1
 		}
