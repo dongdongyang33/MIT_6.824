@@ -88,6 +88,7 @@ type NotifyMsg struct {
 	voteResult *VoteResult // 2
 	appednResult *AppendResult // 3
 	statusMsg *StatusMsg // 4
+	appendCommandByStart interface{} // 5
 }
 //
 // A Go object implementing a single Raft peer.
@@ -196,6 +197,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term int
+	candidateid int
+	lastLogTerm int
+	lastLogIndex int
 }
 
 //
@@ -204,6 +209,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	grantVote bool
+	term int
 }
 
 //
@@ -211,18 +218,49 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	ch := make(chan *RequestVoteReply)
+	para := RequestVotePara{}
+	para.args = args
+	para.reply = reply
+	para.replyCh = ch
+
+	notify := NotifyMsg{}
+	notify.messageType = 0
+	notify.requestVotePara = &para
+
+	rf.notifyCh <- notify
+
+	reply = <- ch
 }
 
 type AppendEntriesArgs struct {
-
+	term int
+	leaderid int
+	prevLogIndex int
+	prevLogTerm int
+	entries []log
+	commitIndex int
 }
 
 type AppendEntriesReply struct {
-
+	appendSuccess bool
+	term int
 }
 
-func (rf * Raft) AppendEntries {
+func (rf * Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ch := make(chan *AppendEntriesReply)
+	para := AppendEntriesPara{}
+	para.args = args
+	para.reply = reply
+	para.replyCh = ch
+	
+	notify := NotifyMsg{}
+	notify.messageType = 1
+	notify.appendEntriesPara = &para
 
+	rf.notifyCh <- notify
+
+	reply = <- ch
 }
 
 //
@@ -280,6 +318,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+
 
 
 	return index, term, isLeader
