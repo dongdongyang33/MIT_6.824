@@ -43,6 +43,52 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Log struct {
+	term int
+	message ApplyMsg
+}
+
+// for routine to handle requestVote RPC
+type RequestVotePara struct {
+	args *requestVoteArgs
+	reply *RequestVoteReply
+	replyCh chan *RequestVoteReply 
+}
+
+// for routine to handle appnedEntries RPC
+type AppendEntriesPara struct {
+	args *AppendEntriesArgs
+	reply *RequestVoteReply
+	replyCh chan *AppendEntriesReply
+}
+
+type VoteResult struct {
+	becomeLeader bool
+	term int
+}
+
+type AppendResult struct {
+	appendSuccess bool
+	term int
+}
+
+type Status struct {
+	term int
+	isLeader bool
+}
+
+type StatusMsg struct {
+	statusReplyCh Status
+}
+
+type NotifyMsg struct {
+	messageType int
+	requestVotePara *RequestVotePara // 0
+	appendEntriesPara *AppendEntriesPara // 1
+	voteResult *VoteResult // 2
+	appednResult *AppendResult // 3
+	statusMsg *StatusMsg // 4
+}
 //
 // A Go object implementing a single Raft peer.
 //
@@ -54,6 +100,29 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
+
+	// 2A + 2B - for all server and must be persisten
+	term int
+	votefor int
+	log []Log
+
+	// 2A + 2B - for all server
+	commitIndex int
+	appliedIndex int
+
+	// 2A + 2B - for leader only
+	match []int
+	next []int
+
+	// additional parameter
+	role int
+	notifyCh chan NotifyMsg
+	timerCh chan int
+	majority int
+	tick int
+	electionTimout int
+	heartbeatTimout int
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -62,10 +131,20 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	notify := NotifyMsg{}
+	ch := make(chan Status)
+	notify.messageType = 4
+	notify.statusMsg = &ch
+
+	rf.notifyCh <- notify
+	status := <- ch
+
+	term = status.term
+	isleader = status.isLeader
+	
 	return term, isleader
 }
 
@@ -132,6 +211,18 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+}
+
+type AppendEntriesArgs struct {
+
+}
+
+type AppendEntriesReply struct {
+
+}
+
+func (rf * Raft) AppendEntries {
+
 }
 
 //
