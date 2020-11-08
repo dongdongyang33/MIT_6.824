@@ -17,14 +17,16 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -44,52 +46,58 @@ type ApplyMsg struct {
 }
 
 type Log struct {
-	term int
+	term    int
 	message ApplyMsg
 }
 
 // for routine to handle requestVote RPC
 type RequestVotePara struct {
-	args *requestVoteArgs
-	reply *RequestVoteReply
-	replyCh chan *RequestVoteReply 
+	args    *RequestVoteArgs
+	reply   *RequestVoteReply
+	replyCh chan *RequestVoteReply
 }
 
 // for routine to handle appnedEntries RPC
 type AppendEntriesPara struct {
-	args *AppendEntriesArgs
-	reply *RequestVoteReply
+	args    *AppendEntriesArgs
+	reply   *AppendEntriesReply
 	replyCh chan *AppendEntriesReply
 }
 
 type VoteResult struct {
 	becomeLeader bool
-	term int
+	term         int
 }
 
 type AppendResult struct {
 	appendSuccess bool
-	term int
+	term          int
 }
 
 type Status struct {
-	term int
+	term     int
 	isLeader bool
+	index    int
 }
 
-type StatusMsg struct {
-	statusReplyCh Status
+type ClientAppendRequest struct {
+	logCommand interface{}
+	replyCh    chan Status
 }
 
 type NotifyMsg struct {
 	messageType int
-	requestVotePara *RequestVotePara // 0
-	appendEntriesPara *AppendEntriesPara // 1
-	voteResult *VoteResult // 2
-	appednResult *AppendResult // 3
-	statusMsg *StatusMsg // 4
-	appendCommandByStart interface{} // 5
+	msg         interface{}
+
+	//	requestVotePara      *RequestVotePara   // 0
+	//	appendEntriesPara    *AppendEntriesPara // 1
+	//	voteResult           *VoteResult        // 2
+	//	appednResult         *AppendResult      // 3
+	//	statusMsg            *StatusMsg         // 4: get status
+	//  clientAppendRequest  ClientAppendRequest // 5
+	//  timer int // 6
 }
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -103,25 +111,26 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 
 	// 2A + 2B - for all server and must be persisten
-	term int
+	term    int
 	votefor int
-	log []Log
+	log     []Log
 
 	// 2A + 2B - for all server
-	commitIndex int
+	commitIndex  int
 	appliedIndex int
 
 	// 2A + 2B - for leader only
 	match []int
-	next []int
+	next  []int
 
 	// additional parameter
-	role int
-	notifyCh chan NotifyMsg
-	timerCh chan int
-	majority int
-	tick int
-	electionTimout int
+	role            int
+	notifyCh        chan NotifyMsg
+	timerCh         chan int
+	majority        int
+	lastLogIndex    int
+	tick            int
+	electionTimout  int
 	heartbeatTimout int
 
 	// Look at the paper's Figure 2 for a description of what
@@ -138,14 +147,14 @@ func (rf *Raft) GetState() (int, bool) {
 	notify := NotifyMsg{}
 	ch := make(chan Status)
 	notify.messageType = 4
-	notify.statusMsg = &ch
+	notify.msg = &ch
 
 	rf.notifyCh <- notify
-	status := <- ch
+	status := <-ch
 
 	term = status.term
 	isleader = status.isLeader
-	
+
 	return term, isleader
 }
 
@@ -164,7 +173,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -188,18 +196,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term int
-	candidateid int
-	lastLogTerm int
+	term         int
+	candidateid  int
+	lastLogTerm  int
 	lastLogIndex int
 }
 
@@ -210,7 +215,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	grantVote bool
-	term int
+	term      int
 }
 
 //
@@ -226,41 +231,41 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	notify := NotifyMsg{}
 	notify.messageType = 0
-	notify.requestVotePara = &para
+	notify.msg = &para
 
 	rf.notifyCh <- notify
 
-	reply = <- ch
+	reply = <-ch
 }
 
 type AppendEntriesArgs struct {
-	term int
-	leaderid int
+	term         int
+	leaderid     int
 	prevLogIndex int
-	prevLogTerm int
-	entries []log
-	commitIndex int
+	prevLogTerm  int
+	entries      []Log
+	commitIndex  int
 }
 
 type AppendEntriesReply struct {
 	appendSuccess bool
-	term int
+	term          int
 }
 
-func (rf * Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ch := make(chan *AppendEntriesReply)
 	para := AppendEntriesPara{}
 	para.args = args
 	para.reply = reply
 	para.replyCh = ch
-	
+
 	notify := NotifyMsg{}
 	notify.messageType = 1
-	notify.appendEntriesPara = &para
+	notify.msg = &para
 
 	rf.notifyCh <- notify
 
-	reply = <- ch
+	reply = <-ch
 }
 
 //
@@ -297,7 +302,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -318,8 +322,21 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	ch := make(chan Status)
+	para := ClientAppendRequest{}
+	para.logCommand = command
+	para.replyCh = ch
 
+	notify := NotifyMsg{}
+	notify.messageType = 6
 
+	rf.notifyCh <- notify
+
+	status := <-ch
+
+	index = status.index
+	term = status.term
+	isLeader = status.isLeader
 
 	return index, term, isLeader
 }
@@ -364,10 +381,118 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	// 2A
+	rf.term = 0
+	rf.votefor = -1
+
+	// 2B - all server
+	rf.commitIndex = 0
+	rf.appliedIndex = 0
+
+	// 2B - leader
+	peerNum := len(rf.peers)
+	rf.match = make([]int, peerNum)
+	rf.next = make([]int, peerNum)
+
+	// additional para
+	rf.role = 0
+	rf.majority = peerNum/2 + 1
+	rf.tick = 10
+	rf.electionTimout = 0
+	rf.heartbeatTimout = 0
+	rf.notifyCh = make(chan NotifyMsg, 100)
+	rf.timerCh = make(chan int)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.raftRoutine()
 
 	return rf
+}
+
+func (rf *Raft) raftRoutine() {
+	go rf.raftTimer()
+	for {
+		select {
+		case notify := <-rf.notifyCh:
+			{
+				msgtype := notify.messageType
+				switch msgtype {
+				case 0: // handle RequestVote RPC
+					{
+						para := notify.msg.(RequestVotePara)
+						rf.handleRequestVote(&para)
+					}
+				case 1: // handle AppendEntries RPC
+					{
+						para := notify.msg.(AppendEntriesPara)
+						rf.handleAppendEntries(&para)
+					}
+
+				case 2: // handle the RequesstVote result which send out by myself
+
+				case 3: // handle the AppendEntries result which send out by myself
+
+				case 4: // handle getStatus request
+
+				case 5: // handle append request from client
+
+				case 6: // handle the time count from timer
+
+				default:
+
+				}
+			}
+		}
+	}
+}
+
+func (rf *Raft) raftTimer() {
+	for {
+		time.Sleep(rf.tick * time.Millisecond)
+		notify := NotifyMsg{}
+		notify.messageType = 7
+		notify.msg = rf.tick
+		rf.notifyCh <- notify
+	}
+}
+
+func (rf *Raft) handleRequestVote(para *RequestVotePara) {
+	para.reply.grantVote = false
+	para.reply.term = rf.term
+
+	if rf.term < para.args.term || (rf.term == para.args.term && rf.votefor == -1) {
+		currentIndex, currentTerm := rf.getLastLogInfo()
+		if currentTerm < para.args.lastLogTerm || (currentTerm == para.args.lastLogTerm && currentIndex <= para.args.lastLogIndex) {
+			rf.term = para.args.term
+			rf.votefor = para.args.candidateid
+			rf.electionTimout = 0
+			para.reply.grantVote = true
+		}
+	}
+	para.replyCh <- para.reply
+}
+
+func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
+	para.reply.appendSuccess = false
+	para.reply.term = rf.term
+
+	if rf.term <= para.args.term {
+		rf.term = para.args.term
+		rf.role = 0
+		rf.votefor = para.args.leaderid
+		rf.electionTimout = 0
+
+		// compare the log and try to append
+		// return success  = true if it can append
+
+	}
+}
+
+func (rf *Raft) getLastLogInfo() (int, int) {
+	index := len(rf.log) - 1
+	term := rf.log[index].term
+
+	return index, term
 }
