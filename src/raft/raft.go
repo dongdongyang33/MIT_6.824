@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -64,20 +65,15 @@ type AppendEntriesPara struct {
 	replyCh chan *AppendEntriesReply
 }
 
-type VoteResult struct {
-	becomeLeader bool
-	term         int
-}
-
-type AppendResult struct {
-	appendSuccess bool
-	term          int
-}
-
 type Status struct {
 	term     int
 	isLeader bool
 	index    int
+}
+
+type VoteStatus struct {
+	votingTerm  int
+	votingCount int
 }
 
 type ClientAppendRequest struct {
@@ -91,7 +87,7 @@ type NotifyMsg struct {
 
 	//	requestVotePara      *RequestVotePara   // 0
 	//	appendEntriesPara    *AppendEntriesPara // 1
-	//	voteResult           *VoteResult        // 2
+	//	voteResult           *RequestVoteReply  // 2
 	//	appednResult         *AppendResult      // 3
 	//	statusMsg            *StatusMsg         // 4: get status
 	//  clientAppendRequest  ClientAppendRequest // 5
@@ -124,14 +120,16 @@ type Raft struct {
 	next  []int
 
 	// additional parameter
-	role            int
-	notifyCh        chan NotifyMsg
-	timerCh         chan int
-	majority        int
-	lastLogIndex    int
-	tick            int
-	electionTimout  int
-	heartbeatTimout int
+	role                   int
+	notifyCh               chan NotifyMsg
+	timerCh                chan int
+	majority               int
+	lastLogIndex           int
+	electionTimout         int
+	heartbeatTimout        int
+	electionTimoutCounter  int
+	heartbeatTimoutCounter int
+	votestatus             VoteStatus
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -144,12 +142,9 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	notify := NotifyMsg{}
 	ch := make(chan Status)
-	notify.messageType = 4
-	notify.msg = &ch
+	rf.sendResultToRoutine(4, &ch)
 
-	rf.notifyCh <- notify
 	status := <-ch
 
 	term = status.term
@@ -202,10 +197,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term         int
-	candidateid  int
-	lastLogTerm  int
-	lastLogIndex int
+	Term         int
+	Candidateid  int
+	LastLogTerm  int
+	LastLogIndex int
 }
 
 //
@@ -214,8 +209,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	grantVote bool
-	term      int
+	GrantVote bool
+	Term      int
 }
 
 //
@@ -229,27 +224,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	para.reply = reply
 	para.replyCh = ch
 
-	notify := NotifyMsg{}
-	notify.messageType = 0
-	notify.msg = &para
-
-	rf.notifyCh <- notify
+	rf.sendResultToRoutine(0, &para)
 
 	reply = <-ch
 }
 
 type AppendEntriesArgs struct {
-	term         int
-	leaderid     int
-	prevLogIndex int
-	prevLogTerm  int
-	entries      []Log
-	commitIndex  int
+	Term         int
+	Leaderid     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	CommitIndex  int
 }
 
 type AppendEntriesReply struct {
-	appendSuccess bool
-	term          int
+	AppendSuccess bool
+	Term          int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -259,11 +250,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	para.reply = reply
 	para.replyCh = ch
 
-	notify := NotifyMsg{}
-	notify.messageType = 1
-	notify.msg = &para
-
-	rf.notifyCh <- notify
+	rf.sendResultToRoutine(1, &para)
 
 	reply = <-ch
 }
@@ -327,10 +314,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	para.logCommand = command
 	para.replyCh = ch
 
-	notify := NotifyMsg{}
-	notify.messageType = 6
-
-	rf.notifyCh <- notify
+	rf.sendResultToRoutine(6, &para)
 
 	status := <-ch
 
@@ -397,11 +381,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// additional para
 	rf.role = 0
 	rf.majority = peerNum/2 + 1
-	rf.tick = 10
-	rf.electionTimout = 0
-	rf.heartbeatTimout = 0
+	rf.electionTimoutCounter = 0
+	rf.heartbeatTimoutCounter = 0
+	rf.electionTimout = 250
+	rf.heartbeatTimout = 100
 	rf.notifyCh = make(chan NotifyMsg, 100)
 	rf.timerCh = make(chan int)
+	rf.votestatus = VoteStatus{0, 0}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -421,16 +407,20 @@ func (rf *Raft) raftRoutine() {
 				switch msgtype {
 				case 0: // handle RequestVote RPC
 					{
-						para := notify.msg.(RequestVotePara)
-						rf.handleRequestVote(&para)
+						para := notify.msg.(*RequestVotePara)
+						rf.handleRequestVote(para)
 					}
 				case 1: // handle AppendEntries RPC
 					{
-						para := notify.msg.(AppendEntriesPara)
-						rf.handleAppendEntries(&para)
+						para := notify.msg.(*AppendEntriesPara)
+						rf.handleAppendEntries(para)
 					}
 
 				case 2: // handle the RequesstVote result which send out by myself
+					{
+						reply := notify.msg.(*RequestVoteReply)
+						rf.handleRequestVoteReply(reply)
+					}
 
 				case 3: // handle the AppendEntries result which send out by myself
 
@@ -439,7 +429,10 @@ func (rf *Raft) raftRoutine() {
 				case 5: // handle append request from client
 
 				case 6: // handle the time count from timer
-
+					{
+						reply := notify.msg.(int)
+						rf.handleTimerNotify(reply)
+					}
 				default:
 
 				}
@@ -450,43 +443,42 @@ func (rf *Raft) raftRoutine() {
 
 func (rf *Raft) raftTimer() {
 	for {
-		time.Sleep(rf.tick * time.Millisecond)
-		notify := NotifyMsg{}
-		notify.messageType = 7
-		notify.msg = rf.tick
-		rf.notifyCh <- notify
+		time.Sleep(10 * time.Millisecond)
+		rf.sendResultToRoutine(7, 10)
 	}
 }
 
 func (rf *Raft) handleRequestVote(para *RequestVotePara) {
-	para.reply.grantVote = false
-	para.reply.term = rf.term
+	para.reply.GrantVote = false
+	para.reply.Term = rf.term
 
-	if rf.term < para.args.term || (rf.term == para.args.term && rf.votefor == -1) {
+	if rf.term < para.args.Term || (rf.term == para.args.Term && rf.votefor == -1) {
 		currentIndex, currentTerm := rf.getLastLogInfo()
-		if currentTerm < para.args.lastLogTerm || (currentTerm == para.args.lastLogTerm && currentIndex <= para.args.lastLogIndex) {
-			rf.term = para.args.term
-			rf.votefor = para.args.candidateid
+		if currentTerm < para.args.LastLogTerm || (currentTerm == para.args.LastLogTerm && currentIndex <= para.args.LastLogIndex) {
+			rf.term = para.args.Term
+			rf.votefor = para.args.Candidateid
 			rf.electionTimout = 0
-			para.reply.grantVote = true
+			para.reply.GrantVote = true
+			para.reply.Term = para.args.Term
 		}
 	}
 	para.replyCh <- para.reply
 }
 
 func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
-	para.reply.appendSuccess = false
-	para.reply.term = rf.term
+	para.reply.AppendSuccess = false
+	para.reply.Term = rf.term
 
-	if rf.term <= para.args.term {
-		rf.term = para.args.term
+	if rf.term <= para.args.Term {
+		rf.term = para.args.Term
 		rf.role = 0
-		rf.votefor = para.args.leaderid
+		rf.votefor = para.args.Leaderid
 		rf.electionTimout = 0
 
-		// compare the log and try to append
-		// return success  = true if it can append
-
+		if para.args.PrevLogIndex != -1 && para.args.PrevLogTerm != -1 {
+			// compare the log and try to append
+			// return success  = true if it can append
+		}
 	}
 }
 
@@ -495,4 +487,114 @@ func (rf *Raft) getLastLogInfo() (int, int) {
 	term := rf.log[index].term
 
 	return index, term
+}
+
+func (rf *Raft) startRequestVote(beginTerm int, currenLastLogIndex int, currenLastLogTerm int) {
+	args := RequestVoteArgs{}
+	args.Term = beginTerm
+	args.Candidateid = rf.me
+	args.LastLogTerm = currenLastLogTerm
+	args.LastLogIndex = currenLastLogIndex
+
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go rf.sendPeerRequestVote(i, &args)
+		}
+	}
+}
+
+func (rf *Raft) sendPeerRequestVote(peerid int, args *RequestVoteArgs) {
+	reply := RequestVoteReply{}
+	ok := rf.peers[peerid].Call("Raft.RequestVote", args, &reply)
+	if !ok {
+		reply.GrantVote = false
+		reply.Term = -1
+	}
+	rf.sendResultToRoutine(2, &reply)
+}
+
+func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
+	if reply.Term == rf.votestatus.votingTerm {
+		if reply.GrantVote == true {
+			rf.votestatus.votingCount += 1
+			if rf.votestatus.votingCount >= rf.majority {
+				rf.role = 2
+				// TODO: send heartbeat immidiately
+				rf.startAppendEntries(true)
+			}
+		}
+	} else {
+		if reply.Term > rf.votestatus.votingTerm {
+			rf.votestatus.votingTerm = reply.Term
+			rf.votestatus.votingCount = 0
+		}
+	}
+}
+
+func (rf *Raft) startAppendEntries(isHeartbeat bool) {
+	args := AppendEntriesArgs{}
+	args.Term = rf.term
+	args.Leaderid = rf.me
+	args.CommitIndex = rf.commitIndex
+	if isHeartbeat {
+		args.Entries = nil
+		args.PrevLogIndex = -1
+		args.PrevLogTerm = -1
+	}
+
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go rf.sendPeerAppendEntries(isHeartbeat, i, args)
+		}
+	}
+}
+
+func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs) {
+	if !isHeartbeat {
+		// TODO: update the args by using next[]
+	}
+	reply := AppendEntriesReply{}
+	ok := rf.peers[peerid].Call("Raft.RequestVote", &args, &reply)
+	if !ok {
+		reply.AppendSuccess = false
+		reply.Term = -1
+	}
+
+	rf.sendResultToRoutine(3, &reply)
+}
+
+func (rf *Raft) handleTimerNotify(tick int) {
+	rf.electionTimoutCounter += tick
+	rf.heartbeatTimoutCounter += tick
+
+	if rf.role == 2 {
+		// leader - send heartbeat or appendentries is timeout
+		// TODO: how to decide which msg leader should send
+		if rf.heartbeatTimoutCounter >= rf.heartbeatTimoutCounter {
+			rf.startAppendEntries(true)
+		}
+	} else {
+		// follower/candidate - begin election
+		if rf.electionTimoutCounter >= rf.electionTimout {
+
+			rf.electionTimoutCounter = 0
+			r := rand.New(rand.NewSource(time.Now().UnixNano()))
+			rf.electionTimout = r.Int31n(150) + 250
+
+			rf.role = 1
+			rf.term += 1
+			rf.votefor = rf.me
+			lastlogIndex, lastLogTerm := rf.getLastLogInfo()
+
+			rf.startRequestVote(rf.term, lastlogIndex, lastLogTerm)
+		}
+	}
+}
+
+func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
+	notify := NotifyMsg{}
+	notify.messageType = msgType
+	notify.msg = msg
+
+	rf.notifyCh <- notify
 }
