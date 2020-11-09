@@ -143,7 +143,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	ch := make(chan Status)
-	rf.sendResultToRoutine(4, &ch)
+	rf.sendResultToRoutine(4, ch)
 
 	status := <-ch
 
@@ -423,8 +423,17 @@ func (rf *Raft) raftRoutine() {
 					}
 
 				case 3: // handle the AppendEntries result which send out by myself
+					{
+						reply := notify.msg.(*AppendEntriesReply)
+						rf.handleAppendEntriesReply(reply)
+					}
 
 				case 4: // handle getStatus request
+					{
+						//ch := make(chan Status)
+						replyCh := notify.msg.(chan Status)
+						rf.handleGetStatusRequest(replyCh)
+					}
 
 				case 5: // handle append request from client
 
@@ -457,7 +466,7 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 		if currentTerm < para.args.LastLogTerm || (currentTerm == para.args.LastLogTerm && currentIndex <= para.args.LastLogIndex) {
 			rf.term = para.args.Term
 			rf.votefor = para.args.Candidateid
-			rf.electionTimout = 0
+			rf.electionTimoutCounter = 0
 			para.reply.GrantVote = true
 			para.reply.Term = para.args.Term
 		}
@@ -473,7 +482,7 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 		rf.term = para.args.Term
 		rf.role = 0
 		rf.votefor = para.args.Leaderid
-		rf.electionTimout = 0
+		rf.electionTimoutCounter = 0
 
 		if para.args.PrevLogIndex != -1 && para.args.PrevLogTerm != -1 {
 			// compare the log and try to append
@@ -483,8 +492,15 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 }
 
 func (rf *Raft) getLastLogInfo() (int, int) {
-	index := len(rf.log) - 1
-	term := rf.log[index].term
+	var index, term int
+	loglen := len(rf.log)
+	if loglen == 0 {
+		index = 0
+		term = 0
+	} else {
+		index = loglen - 1
+		term = rf.log[index].term
+	}
 
 	return index, term
 }
@@ -514,6 +530,23 @@ func (rf *Raft) sendPeerRequestVote(peerid int, args *RequestVoteArgs) {
 }
 
 func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
+	if rf.term < reply.Term {
+		// become follower if receive a reply from a big peer
+		rf.role = 0
+		rf.term = reply.Term
+		rf.votestatus.votingTerm = reply.Term
+		rf.votestatus.votingCount = 0
+		rf.electionTimoutCounter = 0
+	} else { // rf.term >= reply.Term
+		if reply.Term == rf.votestatus.votingTerm && reply.GrantVote { // vote for me.current term
+			rf.votestatus.votingCount += 1
+			if rf.votestatus.votingCount >= rf.majority && rf.role == 1 {
+				rf.role = 2
+				rf.startAppendEntries(true)
+
+			}
+		}
+	}
 	if reply.Term == rf.votestatus.votingTerm {
 		if reply.GrantVote == true {
 			rf.votestatus.votingCount += 1
@@ -531,7 +564,19 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 	}
 }
 
+func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
+	if rf.term < reply.Term {
+		rf.term = reply.Term
+		rf.role = 0
+	} else {
+		// update next[]
+		//
+	}
+}
+
 func (rf *Raft) startAppendEntries(isHeartbeat bool) {
+	rf.heartbeatTimoutCounter = 0
+
 	args := AppendEntriesArgs{}
 	args.Term = rf.term
 	args.Leaderid = rf.me
@@ -589,6 +634,19 @@ func (rf *Raft) handleTimerNotify(tick int) {
 			rf.startRequestVote(rf.term, lastlogIndex, lastLogTerm)
 		}
 	}
+}
+
+func (rf *Raft) handleGetStatusRequest(replyCh chan Status) {
+	reply := Status{}
+	reply.term = rf.term
+	if rf.role == 2 {
+		reply.isLeader = true
+	} else {
+		reply.isLeader = false
+	}
+	reply.index, _ = rf.getLastLogInfo()
+
+	replyCh <- reply
 }
 
 func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
