@@ -47,8 +47,8 @@ type ApplyMsg struct {
 }
 
 type Log struct {
-	term    int
-	message ApplyMsg
+	term int
+	msg  ApplyMsg
 }
 
 // for routine to handle requestVote RPC
@@ -436,6 +436,10 @@ func (rf *Raft) raftRoutine() {
 					}
 
 				case 5: // handle append request from client
+					{
+						msg := notify.msg.(ClientAppendRequest)
+						rf.handleClientAppendMsg(msg)
+					}
 
 				case 6: // handle the time count from timer
 					{
@@ -505,12 +509,17 @@ func (rf *Raft) getLastLogInfo() (int, int) {
 	return index, term
 }
 
-func (rf *Raft) startRequestVote(beginTerm int, currenLastLogIndex int, currenLastLogTerm int) {
+func (rf *Raft) startRequestVote() {
+	rf.term += 1
+	rf.role = 1
+	rf.votefor = rf.me
+	rf.votestatus.votingTerm = rf.term
+	rf.votestatus.votingCount = 0
+
 	args := RequestVoteArgs{}
-	args.Term = beginTerm
+	args.Term = rf.term
 	args.Candidateid = rf.me
-	args.LastLogTerm = currenLastLogTerm
-	args.LastLogIndex = currenLastLogIndex
+	args.LastLogIndex, args.LastLogTerm = rf.getLastLogInfo()
 
 	for i, _ := range rf.peers {
 		if i != rf.me {
@@ -542,24 +551,9 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 			rf.votestatus.votingCount += 1
 			if rf.votestatus.votingCount >= rf.majority && rf.role == 1 {
 				rf.role = 2
-				rf.startAppendEntries(true)
 
-			}
-		}
-	}
-	if reply.Term == rf.votestatus.votingTerm {
-		if reply.GrantVote == true {
-			rf.votestatus.votingCount += 1
-			if rf.votestatus.votingCount >= rf.majority {
-				rf.role = 2
-				// TODO: send heartbeat immidiately
 				rf.startAppendEntries(true)
 			}
-		}
-	} else {
-		if reply.Term > rf.votestatus.votingTerm {
-			rf.votestatus.votingTerm = reply.Term
-			rf.votestatus.votingCount = 0
 		}
 	}
 }
@@ -624,14 +618,9 @@ func (rf *Raft) handleTimerNotify(tick int) {
 
 			rf.electionTimoutCounter = 0
 			r := rand.New(rand.NewSource(time.Now().UnixNano()))
-			rf.electionTimout = r.Int31n(150) + 250
+			rf.electionTimout = int(r.Int31n(150)) + 250
 
-			rf.role = 1
-			rf.term += 1
-			rf.votefor = rf.me
-			lastlogIndex, lastLogTerm := rf.getLastLogInfo()
-
-			rf.startRequestVote(rf.term, lastlogIndex, lastLogTerm)
+			rf.startRequestVote()
 		}
 	}
 }
@@ -647,6 +636,23 @@ func (rf *Raft) handleGetStatusRequest(replyCh chan Status) {
 	reply.index, _ = rf.getLastLogInfo()
 
 	replyCh <- reply
+}
+
+func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
+	reply := Status{}
+	reply.isLeader = false
+	if rf.role == 2 {
+		appendLog := Log{}
+		appendLog.term = rf.term
+		appendLog.msg.Command = msg.logCommand
+
+		rf.log = append(rf.log, appendLog)
+		reply.isLeader = true
+	}
+
+	reply.index, reply.term = rf.getLastLogInfo()
+
+	msg.replyCh <- reply
 }
 
 func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
