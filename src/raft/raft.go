@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -121,14 +122,12 @@ type Raft struct {
 
 	// additional parameter
 	role                   int
-	notifyCh               chan NotifyMsg
-	timerCh                chan int
 	majority               int
-	lastLogIndex           int
 	electionTimout         int
 	heartbeatTimout        int
 	electionTimoutCounter  int
 	heartbeatTimoutCounter int
+	notifyCh               chan NotifyMsg
 	votestatus             VoteStatus
 
 	// Look at the paper's Figure 2 for a description of what
@@ -386,7 +385,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimout = 250
 	rf.heartbeatTimout = 100
 	rf.notifyCh = make(chan NotifyMsg, 100)
-	rf.timerCh = make(chan int)
 	rf.votestatus = VoteStatus{0, 0}
 
 	// initialize from state persisted before a crash
@@ -416,13 +414,13 @@ func (rf *Raft) raftRoutine() {
 						rf.handleAppendEntries(para)
 					}
 
-				case 2: // handle the RequesstVote result which send out by myself
+				case 2: // handle the RequesstVote result which sent out by myself
 					{
 						reply := notify.msg.(*RequestVoteReply)
 						rf.handleRequestVoteReply(reply)
 					}
 
-				case 3: // handle the AppendEntries result which send out by myself
+				case 3: // handle the AppendEntries result which sent out by myself
 					{
 						reply := notify.msg.(*AppendEntriesReply)
 						rf.handleAppendEntriesReply(reply)
@@ -473,6 +471,7 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 			rf.electionTimoutCounter = 0
 			para.reply.GrantVote = true
 			para.reply.Term = para.args.Term
+			log.Println("[server %v] Vote for server %v in term %v", rf.me, rf.votefor, rf.term)
 		}
 	}
 	para.replyCh <- para.reply
@@ -516,6 +515,8 @@ func (rf *Raft) startRequestVote() {
 	rf.votestatus.votingTerm = rf.term
 	rf.votestatus.votingCount = 0
 
+	log.Println("[server %v] election timeout. Begin request vote with term %v", rf.me, rf.term)
+
 	args := RequestVoteArgs{}
 	args.Term = rf.term
 	args.Candidateid = rf.me
@@ -546,12 +547,13 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 		rf.votestatus.votingTerm = reply.Term
 		rf.votestatus.votingCount = 0
 		rf.electionTimoutCounter = 0
+		log.Println("[server %v] become follower by receiving vote reply with term %v", rf.me, rf.term)
 	} else { // rf.term >= reply.Term
 		if reply.Term == rf.votestatus.votingTerm && reply.GrantVote { // vote for me.current term
 			rf.votestatus.votingCount += 1
 			if rf.votestatus.votingCount >= rf.majority && rf.role == 1 {
 				rf.role = 2
-
+				log.Println("[server %v] become leader with term %v", rf.me, rf.term)
 				rf.startAppendEntries(true)
 			}
 		}
@@ -562,9 +564,10 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
 	if rf.term < reply.Term {
 		rf.term = reply.Term
 		rf.role = 0
+		log.Println("[server %v] become follower by receiving append reply with term %v", rf.me, rf.term)
 	} else {
-		// update next[]
-		//
+		// how to update next[]
+
 	}
 }
 
@@ -656,9 +659,11 @@ func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
 }
 
 func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
+	log.Println("")
 	notify := NotifyMsg{}
 	notify.messageType = msgType
 	notify.msg = msg
 
 	rf.notifyCh <- notify
+
 }
