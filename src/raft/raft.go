@@ -127,8 +127,8 @@ type Raft struct {
 	heartbeatTimout        int
 	electionTimoutCounter  int
 	heartbeatTimoutCounter int
+	votingCounter          int
 	notifyCh               chan NotifyMsg
-	votestatus             VoteStatus
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -466,9 +466,7 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 	if rf.term < para.args.Term || (rf.term == para.args.Term && rf.votefor == -1) {
 		currentIndex, currentTerm := rf.getLastLogInfo()
 		if currentTerm < para.args.LastLogTerm || (currentTerm == para.args.LastLogTerm && currentIndex <= para.args.LastLogIndex) {
-			rf.term = para.args.Term
-			rf.votefor = para.args.Candidateid
-			rf.electionTimoutCounter = 0
+			rf.becomeFollower(para.args.Term, para.args.Candidateid)
 			para.reply.GrantVote = true
 			para.reply.Term = para.args.Term
 			log.Println("[server %v] Vote for server %v in term %v", rf.me, rf.votefor, rf.term)
@@ -477,44 +475,8 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 	para.replyCh <- para.reply
 }
 
-func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
-	para.reply.AppendSuccess = false
-	para.reply.Term = rf.term
-
-	if rf.term <= para.args.Term {
-		rf.term = para.args.Term
-		rf.role = 0
-		rf.votefor = para.args.Leaderid
-		rf.electionTimoutCounter = 0
-
-		if para.args.PrevLogIndex != -1 && para.args.PrevLogTerm != -1 {
-			// compare the log and try to append
-			// return success  = true if it can append
-		}
-	}
-}
-
-func (rf *Raft) getLastLogInfo() (int, int) {
-	var index, term int
-	loglen := len(rf.log)
-	if loglen == 0 {
-		index = 0
-		term = 0
-	} else {
-		index = loglen - 1
-		term = rf.log[index].term
-	}
-
-	return index, term
-}
-
 func (rf *Raft) startRequestVote() {
-	rf.term += 1
-	rf.role = 1
-	rf.votefor = rf.me
-	rf.votestatus.votingTerm = rf.term
-	rf.votestatus.votingCount = 0
-
+	rf.becomeCandidate()
 	log.Println("[server %v] election timeout. Begin request vote with term %v", rf.me, rf.term)
 
 	args := RequestVoteArgs{}
@@ -541,37 +503,45 @@ func (rf *Raft) sendPeerRequestVote(peerid int, args *RequestVoteArgs) {
 
 func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 	if rf.term < reply.Term {
-		// become follower if receive a reply from a big peer
-		rf.role = 0
-		rf.term = reply.Term
-		rf.votestatus.votingTerm = reply.Term
-		rf.votestatus.votingCount = 0
-		rf.electionTimoutCounter = 0
+		rf.becomeFollower(reply.Term, -1)
 		log.Println("[server %v] become follower by receiving vote reply with term %v", rf.me, rf.term)
-	} else { // rf.term >= reply.Term
+	} else {
 		if reply.Term == rf.votestatus.votingTerm && reply.GrantVote { // vote for me.current term
 			rf.votestatus.votingCount += 1
 			if rf.votestatus.votingCount >= rf.majority && rf.role == 1 {
-				rf.role = 2
-				log.Println("[server %v] become leader with term %v", rf.me, rf.term)
-				rf.startAppendEntries(true)
+				rf.becomeLeader()
 			}
+		}
+	}
+}
+
+func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
+	para.reply.AppendSuccess = false
+	para.reply.Term = rf.term
+
+	if rf.term <= para.args.Term {
+		rf.becomeFollower(para.args.Term, para.args.Leaderid)
+		if para.args.PrevLogIndex != -1 && para.args.PrevLogTerm != -1 { // heartbeat
+			// TODO: how to append
 		}
 	}
 }
 
 func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
 	if rf.term < reply.Term {
-		rf.term = reply.Term
-		rf.role = 0
+		rf.becomeFollower(reply.Term, -1)
 		log.Println("[server %v] become follower by receiving append reply with term %v", rf.me, rf.term)
 	} else {
-		// how to update next[]
-
+		if rf.term == reply.Term {
+			// how to update next[] and match[]
+			// next[] first and if next[] ok then update match []
+			// and when match change, update commitidex			
+		}
 	}
 }
 
 func (rf *Raft) startAppendEntries(isHeartbeat bool) {
+	// TODO: think again how to re-write this function 
 	rf.heartbeatTimoutCounter = 0
 
 	args := AppendEntriesArgs{}
@@ -636,6 +606,7 @@ func (rf *Raft) handleGetStatusRequest(replyCh chan Status) {
 	} else {
 		reply.isLeader = false
 	}
+	// TODO: re-think here
 	reply.index, _ = rf.getLastLogInfo()
 
 	replyCh <- reply
@@ -658,6 +629,20 @@ func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
 	msg.replyCh <- reply
 }
 
+func (rf *Raft) getLastLogInfo() (int, int) {
+	var index, term int
+	loglen := len(rf.log)
+	if loglen == 0 {
+		index = 0
+		term = 0
+	} else {
+		index = loglen - 1
+		term = rf.log[index].term
+	}
+
+	return index, term
+}
+
 func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
 	log.Println("")
 	notify := NotifyMsg{}
@@ -665,5 +650,28 @@ func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
 	notify.msg = msg
 
 	rf.notifyCh <- notify
+}
 
+func (rf *Raft) becomeFollower(receiveTerm int, receiveVotefor int) {
+	rf.role = 0
+	rf.term = receiveTerm
+	rf.votefor = receiveVotefor
+	rf.votestatus.votingCount = 0
+	rf.electionTimoutCounter = 0
+}
+
+func (rf *Raft) becomeCandidate() {
+	rf.role = 1
+	rf.term += 1
+	rf.votefor = rf.me
+	rf.votestatus.term = rf.term
+	rf.votestatus.votingCount = 1
+	rf.electionTimoutCounter = 0
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.role = 2
+	rf.heartbeatTimoutCounter = 0
+	rf.startAppendEntries(true)
+	// TODO: reinitialize the mathc[] and next[]
 }
