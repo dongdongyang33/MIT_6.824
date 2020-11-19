@@ -85,14 +85,6 @@ type ClientAppendRequest struct {
 type NotifyMsg struct {
 	messageType int
 	msg         interface{}
-
-	//	requestVotePara      *RequestVotePara   // 0
-	//	appendEntriesPara    *AppendEntriesPara // 1
-	//	voteResult           *RequestVoteReply  // 2
-	//	appednResult         *AppendResult      // 3
-	//	statusMsg            *StatusMsg         // 4: get status
-	//  clientAppendRequest  ClientAppendRequest // 5
-	//  timer int // 6
 }
 
 //
@@ -313,7 +305,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	para.logCommand = command
 	para.replyCh = ch
 
-	rf.sendResultToRoutine(6, &para)
+	rf.sendResultToRoutine(5, &para)
 
 	status := <-ch
 
@@ -414,13 +406,13 @@ func (rf *Raft) raftRoutine() {
 						rf.handleAppendEntries(para)
 					}
 
-				case 2: // handle the RequesstVote result which sent out by myself
+				case 2: // handle the RequesstVote reply
 					{
 						reply := notify.msg.(*RequestVoteReply)
 						rf.handleRequestVoteReply(reply)
 					}
 
-				case 3: // handle the AppendEntries result which sent out by myself
+				case 3: // handle the AppendEntries reply
 					{
 						reply := notify.msg.(*AppendEntriesReply)
 						rf.handleAppendEntriesReply(reply)
@@ -455,8 +447,20 @@ func (rf *Raft) raftRoutine() {
 func (rf *Raft) raftTimer() {
 	for {
 		time.Sleep(10 * time.Millisecond)
-		rf.sendResultToRoutine(7, 10)
+		rf.sendResultToRoutine(6, 10)
 	}
+}
+
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	para :=	requestVotePara{}
+	ch := make(chan *RequestVoteReply)
+	para.args = args
+	para.reply = reply
+	para.replyCh = ch
+
+	rf.sendResultToRoutine(0, &para)
+
+	reply <- ch
 }
 
 func (rf *Raft) handleRequestVote(para *RequestVotePara) {
@@ -561,12 +565,28 @@ func (rf *Raft) startAppendEntries(isHeartbeat bool) {
 	}
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//type AppendEntriesPara struct {
+		//args    *AppendEntriesArgs
+		//reply   *AppendEntriesReply
+		//replyCh chan *AppendEntriesReply
+	//}
+	para := appendEntriesPara{}
+	ch := make(chan *AppendEntriesReply)
+	para.args = args
+	para.reply = reply
+
+	rf.sendResultToRoutine(1, &para)
+
+	reply <- ch
+}
+
 func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs) {
 	if !isHeartbeat {
 		// TODO: update the args by using next[]
 	}
 	reply := AppendEntriesReply{}
-	ok := rf.peers[peerid].Call("Raft.RequestVote", &args, &reply)
+	ok := rf.peers[peerid].Call("Raft.AppendEntries", &args, &reply)
 	if !ok {
 		reply.AppendSuccess = false
 		reply.Term = -1
@@ -644,7 +664,6 @@ func (rf *Raft) getLastLogInfo() (int, int) {
 }
 
 func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
-	log.Println("")
 	notify := NotifyMsg{}
 	notify.messageType = msgType
 	notify.msg = msg
@@ -656,7 +675,7 @@ func (rf *Raft) becomeFollower(receiveTerm int, receiveVotefor int) {
 	rf.role = 0
 	rf.term = receiveTerm
 	rf.votefor = receiveVotefor
-	rf.votestatus.votingCount = 0
+	rf.votingCounter = 0
 	rf.electionTimoutCounter = 0
 }
 
@@ -665,7 +684,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.term += 1
 	rf.votefor = rf.me
 	rf.votestatus.term = rf.term
-	rf.votestatus.votingCount = 1
+	rf.votingCounter = 1
 	rf.electionTimoutCounter = 0
 }
 
