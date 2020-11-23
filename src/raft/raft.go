@@ -44,8 +44,8 @@ import (
 //
 type ApplyMsg struct {
 	CommandValid bool
-	Command      interface{}
 	CommandIndex int
+	Command      interface{}
 }
 
 type Log struct {
@@ -68,9 +68,9 @@ type AppendEntriesPara struct {
 }
 
 type Status struct {
-	term     int
 	isLeader bool
 	index    int
+	term     int
 }
 
 type VoteStatus struct {
@@ -449,6 +449,7 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 	para.reply.Term = rf.term
 
 	if rf.term < para.args.Term || (rf.term == para.args.Term && rf.votefor == -1) {
+		rf.becomeFollower(para.args.Term, -1)
 		currentIndex, currentTerm := rf.getLastLogInfo()
 		if currentTerm < para.args.LastLogTerm || (currentTerm == para.args.LastLogTerm && currentIndex <= para.args.LastLogIndex) {
 			rf.becomeFollower(para.args.Term, para.args.Candidateid)
@@ -500,6 +501,59 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 	}
 }
 
+func (rf *Raft) startAppendEntries(isHeartbeat bool) {
+	// TODO: think again how to re-write this function
+	rf.heartbeatTimoutCounter = 0
+
+	args := AppendEntriesArgs{}
+	args.Term = rf.term
+	args.Leaderid = rf.me
+	args.CommitIndex = rf.commitIndex
+	if isHeartbeat {
+		args.Entries = nil
+		args.PrevLogIndex = -1
+		args.PrevLogTerm = -1
+	}
+
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go rf.sendPeerAppendEntries(isHeartbeat, i, args)
+		}
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	para := AppendEntriesPara{}
+	ch := make(chan *AppendEntriesReply)
+	para.args = args
+	para.reply = reply
+	para.replyCh = ch
+
+	rf.sendResultToRoutine(1, &para)
+
+	reply = <-ch
+}
+
+func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs) {
+	if !isHeartbeat {
+		// TODO: update the args by using next[]
+		nextIndex := rf.next[peerid]
+		args.PrevLogIndex = nextIndex - 1
+		args.PrevLogTerm = rf.log[nextIndex-1].term
+		args.Entries = rf.log[nextIndex:]
+	}
+	reply := AppendEntriesReply{}
+	ok := rf.peers[peerid].Call("Raft.AppendEntries", &args, &reply)
+	if !ok {
+		reply.AppendSuccess = false
+		reply.Term = -1
+	}
+	replyWithId := AppendEntriesReplyWithId{}
+	replyWithId.peerid = peerid
+	replyWithId.reply = &reply
+	rf.sendResultToRoutine(3, &replyWithId)
+}
+
 func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 	para.reply.AppendSuccess = false
 	para.reply.Term = rf.term
@@ -527,13 +581,13 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			} else {
 				para.reply.LastLogIndex = currentLogIndex
 				para.reply.LastLogTerm = currentLogTerm
-				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndexForGivenLogTerm(currentLogIndex)
+				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndex(currentLogIndex)
 			}
 		}
 	}
 }
 
-func (rf *Raft) findTheFirstIndexForGivenLogTerm(index int) int {
+func (rf *Raft) findTheFirstIndex(index int) int {
 	currentLastTerm := rf.log[index].term
 	ret := index
 	for i := index - 1; i > 0; i-- {
@@ -588,58 +642,6 @@ func (rf *Raft) updateCommitIndex() {
 	} else {
 		// TODO:
 	}
-}
-
-func (rf *Raft) startAppendEntries(isHeartbeat bool) {
-	// TODO: think again how to re-write this function
-	rf.heartbeatTimoutCounter = 0
-
-	args := AppendEntriesArgs{}
-	args.Term = rf.term
-	args.Leaderid = rf.me
-	args.CommitIndex = rf.commitIndex
-	if isHeartbeat {
-		args.Entries = nil
-		args.PrevLogIndex = -1
-		args.PrevLogTerm = -1
-	}
-
-	for i, _ := range rf.peers {
-		if i != rf.me {
-			go rf.sendPeerAppendEntries(isHeartbeat, i, args)
-		}
-	}
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	para := AppendEntriesPara{}
-	ch := make(chan *AppendEntriesReply)
-	para.args = args
-	para.reply = reply
-
-	rf.sendResultToRoutine(1, &para)
-
-	reply = <-ch
-}
-
-func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs) {
-	if !isHeartbeat {
-		// TODO: update the args by using next[]
-		nextIndex := rf.next[peerid]
-		args.PrevLogIndex = nextIndex - 1
-		args.PrevLogTerm = rf.log[nextIndex-1].term
-		args.Entries = rf.log[nextIndex:]
-	}
-	reply := AppendEntriesReply{}
-	ok := rf.peers[peerid].Call("Raft.AppendEntries", &args, &reply)
-	if !ok {
-		reply.AppendSuccess = false
-		reply.Term = -1
-	}
-	replyWithId := AppendEntriesReplyWithId{}
-	replyWithId.peerid = peerid
-	replyWithId.reply = &reply
-	rf.sendResultToRoutine(3, &replyWithId)
 }
 
 func (rf *Raft) handleTimerNotify(tick int) {
