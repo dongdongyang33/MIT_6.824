@@ -20,6 +20,7 @@ package raft
 import (
 	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,6 +86,11 @@ type ClientAppendRequest struct {
 type NotifyMsg struct {
 	messageType int
 	msg         interface{}
+}
+
+type AppendEntriesReplyWithId struct {
+	peerid int
+	reply  *AppendEntriesReply
 }
 
 //
@@ -204,46 +210,21 @@ type RequestVoteReply struct {
 	Term      int
 }
 
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-	ch := make(chan *RequestVoteReply)
-	para := RequestVotePara{}
-	para.args = args
-	para.reply = reply
-	para.replyCh = ch
-
-	rf.sendResultToRoutine(0, &para)
-
-	reply = <-ch
-}
-
 type AppendEntriesArgs struct {
 	Term         int
 	Leaderid     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []Log
 	CommitIndex  int
+	Entries      []Log
 }
 
 type AppendEntriesReply struct {
-	AppendSuccess bool
-	Term          int
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	ch := make(chan *AppendEntriesReply)
-	para := AppendEntriesPara{}
-	para.args = args
-	para.reply = reply
-	para.replyCh = ch
-
-	rf.sendResultToRoutine(1, &para)
-
-	reply = <-ch
+	AppendSuccess         bool
+	Term                  int
+	LastLogIndex          int
+	LastLogTerm           int
+	LastLogTermFirstIndex int
 }
 
 //
@@ -377,7 +358,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimout = 250
 	rf.heartbeatTimout = 100
 	rf.notifyCh = make(chan NotifyMsg, 100)
-	rf.votestatus = VoteStatus{0, 0}
+	rf.votingCounter = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -414,7 +395,7 @@ func (rf *Raft) raftRoutine() {
 
 				case 3: // handle the AppendEntries reply
 					{
-						reply := notify.msg.(*AppendEntriesReply)
+						reply := notify.msg.(*AppendEntriesReplyWithId)
 						rf.handleAppendEntriesReply(reply)
 					}
 
@@ -452,7 +433,7 @@ func (rf *Raft) raftTimer() {
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	para :=	requestVotePara{}
+	para := RequestVotePara{}
 	ch := make(chan *RequestVoteReply)
 	para.args = args
 	para.reply = reply
@@ -460,7 +441,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.sendResultToRoutine(0, &para)
 
-	reply <- ch
+	reply = <-ch
 }
 
 func (rf *Raft) handleRequestVote(para *RequestVotePara) {
@@ -510,9 +491,9 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 		rf.becomeFollower(reply.Term, -1)
 		log.Println("[server %v] become follower by receiving vote reply with term %v", rf.me, rf.term)
 	} else {
-		if reply.Term == rf.votestatus.votingTerm && reply.GrantVote { // vote for me.current term
-			rf.votestatus.votingCount += 1
-			if rf.votestatus.votingCount >= rf.majority && rf.role == 1 {
+		if reply.Term == rf.term && reply.GrantVote { // vote for me.current term
+			rf.votingCounter += 1
+			if rf.votingCounter >= rf.majority && rf.role == 1 {
 				rf.becomeLeader()
 			}
 		}
@@ -525,27 +506,92 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 
 	if rf.term <= para.args.Term {
 		rf.becomeFollower(para.args.Term, para.args.Leaderid)
-		if para.args.PrevLogIndex != -1 && para.args.PrevLogTerm != -1 { // heartbeat
-			// TODO: how to append
+		para.reply.Term = rf.term
+		if para.args.PrevLogIndex == -1 && para.args.PrevLogTerm == -1 { // heartbeat
+			para.reply.AppendSuccess = true
+			para.reply.LastLogIndex = -1
+		} else { // appendEntries
+			currentLogIndex, currentLogTerm := rf.getLastLogInfo()
+
+			if currentLogIndex > para.args.PrevLogIndex {
+				// if log longer than leader, truncate
+				// need to find the truncate point
+				rf.log = rf.log[:para.args.PrevLogIndex+1]
+				currentLogIndex, currentLogTerm = rf.getLastLogInfo()
+			}
+
+			if currentLogIndex == para.args.PrevLogIndex && currentLogTerm == para.args.PrevLogTerm {
+				para.reply.AppendSuccess = true
+				rf.log = append(rf.log, para.args.Entries...)
+				para.reply.LastLogIndex, _ = rf.getLastLogInfo()
+			} else {
+				para.reply.LastLogIndex = currentLogIndex
+				para.reply.LastLogTerm = currentLogTerm
+				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndexForGivenLogTerm(currentLogIndex)
+			}
 		}
 	}
 }
 
-func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
+func (rf *Raft) findTheFirstIndexForGivenLogTerm(index int) int {
+	currentLastTerm := rf.log[index].term
+	ret := index
+	for i := index - 1; i > 0; i-- {
+		if rf.log[i].term != currentLastTerm {
+			ret = i
+			break
+		}
+	}
+	return ret
+}
+
+func (rf *Raft) handleAppendEntriesReply(replywithid *AppendEntriesReplyWithId) {
+	reply := replywithid.reply
+	peerid := replywithid.peerid
 	if rf.term < reply.Term {
 		rf.becomeFollower(reply.Term, -1)
 		log.Println("[server %v] become follower by receiving append reply with term %v", rf.me, rf.term)
 	} else {
+		// TODO: re-think about reply.
 		if rf.term == reply.Term {
+			if reply.AppendSuccess {
+				if reply.LastLogIndex != -1 { // not a heartbeat reply
+					rf.match[peerid] = reply.LastLogIndex
+					rf.next[peerid] = reply.LastLogIndex + 1
+					currentIndex, _ := rf.getLastLogInfo()
+					if currentIndex > rf.next[peerid] {
+						rf.next[peerid]++
+					}
+					rf.updateCommitIndex()
+				}
+				// need to update commitindex at the same time
+			} else {
+				// TODO: make back
+				rf.next[peerid]--
+			}
 			// how to update next[] and match[]
 			// next[] first and if next[] ok then update match []
-			// and when match change, update commitidex			
+			// and when match change, update commitidex
 		}
 	}
 }
 
+func (rf *Raft) updateCommitIndex() {
+	sortslice := rf.match[:]
+	sort.Sort(sortslice)
+	commitPoint := len(rf.peers) - rf.majority
+	commitPointTerm := rf.log[commitPoint].term
+	if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
+		rf.commitIndex = commitPoint
+		log.Printf("[server %v] commit index update to %v", rf.me, rf.commitIndex)
+		// TODO: append logical
+	} else {
+		// TODO:
+	}
+}
+
 func (rf *Raft) startAppendEntries(isHeartbeat bool) {
-	// TODO: think again how to re-write this function 
+	// TODO: think again how to re-write this function
 	rf.heartbeatTimoutCounter = 0
 
 	args := AppendEntriesArgs{}
@@ -566,24 +612,23 @@ func (rf *Raft) startAppendEntries(isHeartbeat bool) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	//type AppendEntriesPara struct {
-		//args    *AppendEntriesArgs
-		//reply   *AppendEntriesReply
-		//replyCh chan *AppendEntriesReply
-	//}
-	para := appendEntriesPara{}
+	para := AppendEntriesPara{}
 	ch := make(chan *AppendEntriesReply)
 	para.args = args
 	para.reply = reply
 
 	rf.sendResultToRoutine(1, &para)
 
-	reply <- ch
+	reply = <-ch
 }
 
 func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs) {
 	if !isHeartbeat {
 		// TODO: update the args by using next[]
+		nextIndex := rf.next[peerid]
+		args.PrevLogIndex = nextIndex - 1
+		args.PrevLogTerm = rf.log[nextIndex-1].term
+		args.Entries = rf.log[nextIndex:]
 	}
 	reply := AppendEntriesReply{}
 	ok := rf.peers[peerid].Call("Raft.AppendEntries", &args, &reply)
@@ -591,8 +636,10 @@ func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendE
 		reply.AppendSuccess = false
 		reply.Term = -1
 	}
-
-	rf.sendResultToRoutine(3, &reply)
+	replyWithId := AppendEntriesReplyWithId{}
+	replyWithId.peerid = peerid
+	replyWithId.reply = &reply
+	rf.sendResultToRoutine(3, &replyWithId)
 }
 
 func (rf *Raft) handleTimerNotify(tick int) {
@@ -683,7 +730,6 @@ func (rf *Raft) becomeCandidate() {
 	rf.role = 1
 	rf.term += 1
 	rf.votefor = rf.me
-	rf.votestatus.term = rf.term
 	rf.votingCounter = 1
 	rf.electionTimoutCounter = 0
 }
@@ -691,6 +737,10 @@ func (rf *Raft) becomeCandidate() {
 func (rf *Raft) becomeLeader() {
 	rf.role = 2
 	rf.heartbeatTimoutCounter = 0
+	lastindex, _ := rf.getLastLogInfo()
+	for i, _ := range rf.peers {
+		rf.match[i] = 0
+		rf.next[i] = lastindex
+	}
 	rf.startAppendEntries(true)
-	// TODO: reinitialize the mathc[] and next[]
 }
