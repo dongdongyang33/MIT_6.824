@@ -417,6 +417,11 @@ func (rf *Raft) raftRoutine() {
 						reply := notify.msg.(int)
 						rf.handleTimerNotify(reply)
 					}
+				case 7:
+					{
+						msg := notify.msg.(int)
+						rf.handleSendAppendNotify(msg)
+					}
 				default:
 
 				}
@@ -424,6 +429,7 @@ func (rf *Raft) raftRoutine() {
 		}
 	}
 }
+
 
 func (rf *Raft) raftTimer() {
 	for {
@@ -501,27 +507,6 @@ func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 	}
 }
 
-func (rf *Raft) startAppendEntries(isHeartbeat bool) {
-	// TODO: think again how to re-write this function
-	rf.heartbeatTimoutCounter = 0
-
-	args := AppendEntriesArgs{}
-	args.Term = rf.term
-	args.Leaderid = rf.me
-	args.CommitIndex = rf.commitIndex
-	if isHeartbeat {
-		args.Entries = nil
-		args.PrevLogIndex = -1
-		args.PrevLogTerm = -1
-	}
-
-	for i, _ := range rf.peers {
-		if i != rf.me {
-			go rf.sendPeerAppendEntries(isHeartbeat, i, args)
-		}
-	}
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	para := AppendEntriesPara{}
 	ch := make(chan *AppendEntriesReply)
@@ -534,14 +519,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply = <-ch
 }
 
-func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs) {
-	if !isHeartbeat {
-		// TODO: update the args by using next[]
-		nextIndex := rf.next[peerid]
-		args.PrevLogIndex = nextIndex - 1
-		args.PrevLogTerm = rf.log[nextIndex-1].term
-		args.Entries = rf.log[nextIndex:]
+func (rf *Raft) startAppendEntries(isHeartbeat bool) {
+	// TODO: think again how to re-write this function
+	rf.heartbeatTimoutCounter = 0
+
+	for i, _ := range rf.peers {
+		if i != rf.me {
+			go rf.sendPeerAppendEntries(isHeartbeat, i)
+		}
 	}
+}
+
+
+func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int) {
+	args := rf.generateAppendArgs(isHeartbeat, peerid)
 	reply := AppendEntriesReply{}
 	ok := rf.peers[peerid].Call("Raft.AppendEntries", &args, &reply)
 	if !ok {
@@ -585,6 +576,34 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			}
 		}
 	}
+	para.replyCh <- para.reply
+}
+
+
+func (rf *Raft) handleSendAppendNotify(peerid int) {
+	if rf.role == 2 {
+		//rf.sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs)
+		args := rf.generateAppendArgs(peerid, false)
+		go rf.sendPeerAppendEntries(false, peerid, args)
+	}
+}
+
+func (rf *Raft) generateAppendArgs(isHeartbeat bool, peerid int) AppendEntriesArgs {
+	args := AppendEntriesArgs{}
+	args.Term = rf.term
+	args.Leaderid = rf.me
+	args.CommitIndex = rf.commitIndex
+	if isHeartbeat || (rf.next[peerid] == len(rf.log)){
+		args.PrevLogIndex = -1
+		args.PrevLogTerm = -1
+		args.Entries = nil
+	} else {
+		nextIndex := rf.next[peerid]
+		args.PrevLogIndex = nextIndex - 1
+		args.PrevLogTerm = rf.log[nextIndex-1].term
+		args.Entries = rf.log[nextIndex:]
+	}
+	return args
 }
 
 func (rf *Raft) findTheFirstIndex(index int) int {
@@ -617,6 +636,7 @@ func (rf *Raft) handleAppendEntriesReply(replywithid *AppendEntriesReplyWithId) 
 						rf.next[peerid]++
 					}
 					rf.updateCommitIndex()
+					rf.sendResultToRoutine(7, replywithid.peerid)
 				}
 				// need to update commitindex at the same time
 			} else {
@@ -744,5 +764,5 @@ func (rf *Raft) becomeLeader() {
 		rf.match[i] = 0
 		rf.next[i] = lastindex
 	}
-	rf.startAppendEntries(true)
+	rf.startAppendEntries(false)
 }
