@@ -560,7 +560,6 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 
 			if currentLogIndex > para.args.PrevLogIndex {
 				// if log longer than leader, truncate
-				// need to find the truncate point
 				rf.log = rf.log[:para.args.PrevLogIndex+1]
 				currentLogIndex, currentLogTerm = rf.getLastLogInfo()
 			}
@@ -627,8 +626,8 @@ func (rf *Raft) handleAppendEntriesReply(replywithid *AppendEntriesReplyWithId) 
 	} else {
 		// TODO: re-think about reply.
 		if rf.term == reply.Term {
-			if reply.AppendSuccess {
-				if reply.LastLogIndex != -1 { // not a heartbeat reply
+			if reply.AppendSuccess { 
+				if reply.LastLogIndex != -1  { // not a heartbeat reply 
 					rf.match[peerid] = reply.LastLogIndex
 					rf.next[peerid] = reply.LastLogIndex + 1
 					currentIndex, _ := rf.getLastLogInfo()
@@ -641,7 +640,8 @@ func (rf *Raft) handleAppendEntriesReply(replywithid *AppendEntriesReplyWithId) 
 				// need to update commitindex at the same time
 			} else {
 				// TODO: make back
-				rf.next[peerid]--
+				rf.next[peerid] = reply.LastLogTermFirstIndex
+				rf.sendResultToRoutine(7, replywithid.peerid)
 			}
 			// how to update next[] and match[]
 			// next[] first and if next[] ok then update match []
