@@ -595,14 +595,21 @@ func (rf *Raft) generateAppendArgs(isHeartbeat bool, peerid int) AppendEntriesAr
 	args.Term = rf.term
 	args.Leaderid = rf.me
 	args.CommitIndex = rf.commitIndex
-	if isHeartbeat || (rf.next[peerid] == len(rf.log)){
+	currentlen := len(rf.log)
+	if isHeartbeat || (rf.next[peerid] >= currentlen)) || (currentlen == 0) {
 		args.PrevLogIndex = -1
 		args.PrevLogTerm = -1
 		args.Entries = nil
 	} else {
 		nextIndex := rf.next[peerid]
-		args.PrevLogIndex = nextIndex - 1
-		args.PrevLogTerm = rf.log[nextIndex-1].term
+		if nextIndex != 0 {
+			args.PrevLogIndex = nextIndex - 1
+			args.PrevLogTerm = rf.log[nextIndex-1].term			
+		} else {
+			args.PrevLogIndex = nextIndex
+			args.PrevLogTerm = rf.log[nextIndex].term	
+		}
+
 		args.Entries = rf.log[nextIndex:]
 	}
 	return args
