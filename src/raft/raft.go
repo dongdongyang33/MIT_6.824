@@ -73,18 +73,13 @@ type Status struct {
 	term     int
 }
 
-type VoteStatus struct {
-	votingTerm  int
-	votingCount int
-}
-
 type ClientAppendRequest struct {
 	logCommand interface{}
 	replyCh    chan Status
 }
 
 type NotifyMsg struct {
-	messageType int
+	messageType MsgType
 	msg         interface{}
 }
 
@@ -92,6 +87,19 @@ type AppendEntriesReplyWithId struct {
 	peerid int
 	reply  *AppendEntriesReply
 }
+
+type MsgType int
+
+const (
+	RequestVoteMsg 			MsgType = 0
+	AppendEntriesMsg 		MsgType = 1
+	RequestVoteReplyMsg 	MsgType = 2
+	AppendEntriesReplyMsg 	MsgType = 3
+	GetStatusMsg 			MsgType = 4
+	ClientAppendMsg 		MsgType = 5
+	TimerMsg 				MsgType = 6
+	AppendNotifyMsg 		MsgType = 7
+)
 
 //
 // A Go object implementing a single Raft peer.
@@ -376,55 +384,52 @@ func (rf *Raft) raftRoutine() {
 			{
 				msgtype := notify.messageType
 				switch msgtype {
-				case 0: // handle RequestVote RPC
+				case RequestVoteMsg: // handle RequestVote RPC
 					{
 						para := notify.msg.(*RequestVotePara)
 						rf.handleRequestVote(para)
 					}
-				case 1: // handle AppendEntries RPC
+				case AppendEntriesMsg: // handle AppendEntries RPC
 					{
 						para := notify.msg.(*AppendEntriesPara)
 						rf.handleAppendEntries(para)
 					}
 
-				case 2: // handle the RequesstVote reply
+				case RequestVoteReplyMsg: // handle the RequesstVote reply
 					{
 						reply := notify.msg.(*RequestVoteReply)
 						rf.handleRequestVoteReply(reply)
 					}
 
-				case 3: // handle the AppendEntries reply
+				case AppendEntriesReplyMsg: // handle the AppendEntries reply
 					{
 						reply := notify.msg.(*AppendEntriesReplyWithId)
 						rf.handleAppendEntriesReply(reply)
 					}
 
-				case 4: // handle getStatus request
+				case GetStateMsg: // handle getStatus request
 					{
 						//ch := make(chan Status)
 						replyCh := notify.msg.(chan Status)
 						rf.handleGetStatusRequest(replyCh)
 					}
 
-				case 5: // handle append request from client
+				case ClientAppendMsg: // handle append request from client
 					{
 						msg := notify.msg.(ClientAppendRequest)
 						rf.handleClientAppendMsg(msg)
 					}
 
-				case 6: // handle the time count from timer
+				case TimerMsg: // handle the time count from timer
 					{
 						reply := notify.msg.(int)
 						rf.handleTimerNotify(reply)
 					}
-				case 7:
+				case AppendNotifyMsg:
 					{
 						msg := notify.msg.(int)
 						rf.handleSendAppendNotify(msg)
 					}
-				default:
-
-				}
 			}
 		}
 	}
@@ -434,7 +439,7 @@ func (rf *Raft) raftRoutine() {
 func (rf *Raft) raftTimer() {
 	for {
 		time.Sleep(10 * time.Millisecond)
-		rf.sendResultToRoutine(6, 10)
+		rf.sendResultToRoutine(TimerMsg, 10)
 	}
 }
 
@@ -445,7 +450,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	para.reply = reply
 	para.replyCh = ch
 
-	rf.sendResultToRoutine(0, &para)
+	rf.sendResultToRoutine(RequestVoteMsg, &para)
 
 	reply = <-ch
 }
@@ -490,7 +495,7 @@ func (rf *Raft) sendPeerRequestVote(peerid int, args *RequestVoteArgs) {
 		reply.GrantVote = false
 		reply.Term = -1
 	}
-	rf.sendResultToRoutine(2, &reply)
+	rf.sendResultToRoutine(RequestVoteReplyMsg, &reply)
 }
 
 func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
@@ -514,13 +519,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	para.reply = reply
 	para.replyCh = ch
 
-	rf.sendResultToRoutine(1, &para)
+	rf.sendResultToRoutine(AppendEntriesMsg, &para)
 
 	reply = <-ch
 }
 
 func (rf *Raft) startAppendEntries(isHeartbeat bool) {
-	// TODO: think again how to re-write this function
 	rf.heartbeatTimoutCounter = 0
 
 	for i, _ := range rf.peers {
@@ -542,7 +546,7 @@ func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int) {
 	replyWithId := AppendEntriesReplyWithId{}
 	replyWithId.peerid = peerid
 	replyWithId.reply = &reply
-	rf.sendResultToRoutine(3, &replyWithId)
+	rf.sendResultToRoutine(AppendEntriesReplyMsg, &replyWithId)
 }
 
 func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
@@ -581,7 +585,6 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 
 func (rf *Raft) handleSendAppendNotify(peerid int) {
 	if rf.role == 2 {
-		//rf.sendPeerAppendEntries(isHeartbeat bool, peerid int, args AppendEntriesArgs)
 		args := rf.generateAppendArgs(peerid, false)
 		go rf.sendPeerAppendEntries(false, peerid, args)
 	}
@@ -606,13 +609,15 @@ func (rf *Raft) generateAppendArgs(isHeartbeat bool, peerid int) AppendEntriesAr
 }
 
 func (rf *Raft) findTheFirstIndex(index int) int {
-	currentLastTerm := rf.log[index].term
 	ret := index
-	for i := index - 1; i > 0; i-- {
-		if rf.log[i].term != currentLastTerm {
-			ret = i
-			break
-		}
+	if ret != 0 {
+		currentLastTerm := rf.log[index].term
+		for i := index - 1; i > 0; i-- {
+			if rf.log[i].term != currentLastTerm {
+				ret = i
+				break
+			}
+		}		
 	}
 	return ret
 }
@@ -707,10 +712,13 @@ func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
 	if rf.role == 2 {
 		appendLog := Log{}
 		appendLog.term = rf.term
+		appendLog.msg.CommandValid = true
 		appendLog.msg.Command = msg.logCommand
 
 		rf.log = append(rf.log, appendLog)
 		reply.isLeader = true
+
+		rf.startAppendEntries(false)
 	}
 
 	reply.index, reply.term = rf.getLastLogInfo()
@@ -732,7 +740,7 @@ func (rf *Raft) getLastLogInfo() (int, int) {
 	return index, term
 }
 
-func (rf *Raft) sendResultToRoutine(msgType int, msg interface{}) {
+func (rf *Raft) sendResultToRoutine(msgType MsgType, msg interface{}) {
 	notify := NotifyMsg{}
 	notify.messageType = msgType
 	notify.msg = msg
