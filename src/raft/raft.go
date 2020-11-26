@@ -524,21 +524,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply = <-ch
 }
 
-func (rf *Raft) startAppendEntries(isHeartbeat bool) {
+func (rf *Raft) startAppendEntries() {
 	rf.heartbeatTimoutCounter = 0
 
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			go rf.sendPeerAppendEntries(isHeartbeat, i)
+			args := rf.generateAppendArgs(i)
+			go rf.sendPeerAppendEntries(args, i)
 		}
 	}
 }
 
 
-func (rf *Raft) sendPeerAppendEntries(isHeartbeat bool, peerid int) {
-	args := rf.generateAppendArgs(isHeartbeat, peerid)
+func (rf *Raft) sendPeerAppendEntries(args *AppendEntriesArgs, peerid int) {
 	reply := AppendEntriesReply{}
-	ok := rf.peers[peerid].Call("Raft.AppendEntries", &args, &reply)
+	ok := rf.peers[peerid].Call("Raft.AppendEntries", args, &reply)
 	if !ok {
 		reply.AppendSuccess = false
 		reply.Term = -1
@@ -571,10 +571,9 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			if currentLogIndex == para.args.PrevLogIndex && currentLogTerm == para.args.PrevLogTerm {
 				para.reply.AppendSuccess = true
 				rf.log = append(rf.log, para.args.Entries...)
-				para.reply.LastLogIndex, _ = rf.getLastLogInfo()
+				para.reply.LastLogIndex, _ = rf.getLastLogInfo() // for leader update match
 			} else {
-				para.reply.LastLogIndex = currentLogIndex
-				para.reply.LastLogTerm = currentLogTerm
+				para.reply.LastLogIndex = currentLogIndex 
 				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndex(currentLogIndex)
 			}
 		}
@@ -590,29 +589,32 @@ func (rf *Raft) handleSendAppendNotify(peerid int) {
 	}
 }
 
-func (rf *Raft) generateAppendArgs(isHeartbeat bool, peerid int) AppendEntriesArgs {
+func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 	args := AppendEntriesArgs{}
 	args.Term = rf.term
 	args.Leaderid = rf.me
 	args.CommitIndex = rf.commitIndex
 	currentlen := len(rf.log)
-	if isHeartbeat || (rf.next[peerid] >= currentlen)) || (currentlen == 0) {
+	next := rf.next[peerid]
+	match := rf.match[peerid]
+
+	if (next - 1 == match) && (next == currentlen) {
+		// heartbeat
 		args.PrevLogIndex = -1
 		args.PrevLogTerm = -1
 		args.Entries = nil
 	} else {
-		nextIndex := rf.next[peerid]
-		if nextIndex != 0 {
-			args.PrevLogIndex = nextIndex - 1
-			args.PrevLogTerm = rf.log[nextIndex-1].term			
+		// Append
+		if next == 0 {
+			args.PrevLogIndex = 0
+			args.PrevLogTerm = rf.log[next].term 
 		} else {
-			args.PrevLogIndex = nextIndex
-			args.PrevLogTerm = rf.log[nextIndex].term	
+			args.PrevLogIndex = next - 1
+			args.PrevLogTerm = rf.log[next-1].term
 		}
-
-		args.Entries = rf.log[nextIndex:]
+		args.Entries = rf.log[next:]
 	}
-	return args
+	return &args
 }
 
 func (rf *Raft) findTheFirstIndex(index int) int {
@@ -621,7 +623,7 @@ func (rf *Raft) findTheFirstIndex(index int) int {
 		currentLastTerm := rf.log[index].term
 		for i := index - 1; i > 0; i-- {
 			if rf.log[i].term != currentLastTerm {
-				ret = i
+				ret = i + 1
 				break
 			}
 		}		
@@ -642,22 +644,11 @@ func (rf *Raft) handleAppendEntriesReply(replywithid *AppendEntriesReplyWithId) 
 				if reply.LastLogIndex != -1  { // not a heartbeat reply 
 					rf.match[peerid] = reply.LastLogIndex
 					rf.next[peerid] = reply.LastLogIndex + 1
-					currentIndex, _ := rf.getLastLogInfo()
-					if currentIndex > rf.next[peerid] {
-						rf.next[peerid]++
-					}
 					rf.updateCommitIndex()
-					rf.sendResultToRoutine(7, replywithid.peerid)
 				}
-				// need to update commitindex at the same time
 			} else {
-				// TODO: make back
 				rf.next[peerid] = reply.LastLogTermFirstIndex
-				rf.sendResultToRoutine(7, replywithid.peerid)
 			}
-			// how to update next[] and match[]
-			// next[] first and if next[] ok then update match []
-			// and when match change, update commitidex
 		}
 	}
 }
@@ -684,7 +675,7 @@ func (rf *Raft) handleTimerNotify(tick int) {
 		// leader - send heartbeat or appendentries is timeout
 		// TODO: how to decide which msg leader should send
 		if rf.heartbeatTimoutCounter >= rf.heartbeatTimoutCounter {
-			rf.startAppendEntries(true)
+			rf.startAppendEntries()
 		}
 	} else {
 		// follower/candidate - begin election
@@ -725,7 +716,7 @@ func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
 		rf.log = append(rf.log, appendLog)
 		reply.isLeader = true
 
-		rf.startAppendEntries(false)
+		rf.startAppendEntries()
 	}
 
 	reply.index, reply.term = rf.getLastLogInfo()
@@ -779,5 +770,5 @@ func (rf *Raft) becomeLeader() {
 		rf.match[i] = 0
 		rf.next[i] = lastindex
 	}
-	rf.startAppendEntries(false)
+	rf.startAppendEntries()
 }
