@@ -562,23 +562,52 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 		} else { // appendEntries
 			currentLogIndex, currentLogTerm := rf.getLastLogInfo()
 
-			if currentLogIndex > para.args.PrevLogIndex {
-				// if log longer than leader, truncate
-				rf.log = rf.log[:para.args.PrevLogIndex+1]
-				currentLogIndex, currentLogTerm = rf.getLastLogInfo()
+			if currentLogIndex >= para.args.PrevLogIndex {
+				if rf.log[para.args.PrevLogIndex].term == para.args.PrevLogTerm {
+					appendLen := len(para.args.Entries)
+					extendLen := len(rf.log[para.args.PrevLogIndex+1:])
+					base := para.args.PrevLogIndex + 1
+					bound := min(appendLen, extendLen)
+					diff := false
+
+					for i := 0; i < bound; i++ {
+						aTerm := para.args.Entries[i].term
+						myTerm := rf.log[base + i].term
+						if aTerm != myTerm {
+							rf.log = rf.log[:base + i + 1]
+							rf.log = append(rf.log, para.args.Entries...)
+							diff = true
+							break
+						}
+					}
+
+					if !diff && (appendLen > extendLen) {
+						appendEntries := para.args.Entries[buond:]
+						rf.log = append(rf.log, appendEntries...)
+					}
+
+					currentLogIndex, currentLogTerm = rf.getLastLogInfo()
+					para.reply.AppendSuccess = true
+				}
 			}
 
-			if currentLogIndex == para.args.PrevLogIndex && currentLogTerm == para.args.PrevLogTerm {
-				para.reply.AppendSuccess = true
-				rf.log = append(rf.log, para.args.Entries...)
-				para.reply.LastLogIndex, _ = rf.getLastLogInfo() // for leader update match
-			} else {
-				para.reply.LastLogIndex = currentLogIndex 
+			para.reply.LastLogIndex = currentLogIndex
+			para.reply.LastLogTerm = currentLogTerm
+
+			if !para.reply.AppendSuccess {
 				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndex(currentLogIndex)
 			}
 		}
 	}
 	para.replyCh <- para.reply
+}
+
+func min(a int, b int) int {
+	if a >= b {
+		return a
+	} else {
+		return b
+	}
 }
 
 
