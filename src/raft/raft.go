@@ -84,9 +84,9 @@ type NotifyMsg struct {
 }
 
 type AppendEntriesReplyDetail struct {
-	peerid   int
-	sendNext int
-	reply    *AppendEntriesReply
+	peerid       int
+	updatedMatch int
+	reply        *AppendEntriesReply
 }
 
 type SortSlice []int
@@ -296,7 +296,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
 	ch := make(chan Status)
 	para := ClientAppendRequest{}
 	para.logCommand = command
@@ -380,8 +379,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.majority = peerNum/2 + 1
 	rf.electionTimoutCounter = 0
 	rf.heartbeatTimoutCounter = 0
-	rf.randTheTimeout(300)
-	rf.heartbeatTimout = 150
+	rf.randTheTimeout(150)
+	rf.heartbeatTimout = 100
 	rf.notifyCh = make(chan NotifyMsg, 100)
 	rf.votingCounter = 0
 
@@ -462,15 +461,17 @@ func (rf *Raft) raftTimer() {
 
 func (rf *Raft) appliedLog() {
 	for {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 		currentCommitindex := rf.commitIndex
+		currentLogLen := len(rf.log) - 1
+		applyBound := min(currentCommitindex, currentLogLen)
 		if rf.appliedIndex < currentCommitindex {
 			log.Printf("[server %d] applied index update from %v to %v",
-				rf.me, rf.appliedIndex, currentCommitindex)
-			for i := rf.appliedIndex + 1; i <= currentCommitindex; i++ {
+				rf.me, rf.appliedIndex, applyBound)
+			for i := rf.appliedIndex + 1; i <= applyBound; i++ {
 				rf.applyCh <- rf.log[i].Msg
 			}
-			rf.appliedIndex = currentCommitindex
+			rf.appliedIndex = applyBound
 		}
 	}
 }
@@ -577,7 +578,7 @@ func (rf *Raft) sendPeerAppendEntries(args *AppendEntriesArgs, peerid int) {
 	}
 	replyDetail := AppendEntriesReplyDetail{}
 	replyDetail.peerid = peerid
-	replyDetail.sendNext = args.PrevLogIndex + 1
+	replyDetail.updatedMatch = args.PrevLogIndex + len(args.Entries)
 	replyDetail.reply = &reply
 	rf.sendResultToRoutine(AppendEntriesReplyMsg, &replyDetail)
 }
@@ -589,6 +590,9 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 	if rf.term <= para.args.Term {
 		rf.becomeFollower(para.args.Term, para.args.Leaderid)
 		para.reply.Term = rf.term
+		if para.args.CommitIndex > rf.commitIndex {
+			rf.commitIndex = para.args.CommitIndex
+		}
 		if para.args.Heartbeat { // heartbeat
 			para.reply.AppendSuccess = true
 			para.reply.LastLogIndex = -1
@@ -598,10 +602,10 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			if currentLogIndex == para.args.PrevLogIndex {
 				if currentLogTerm == para.args.PrevLogTerm {
 					// same. append directly
-					log.Printf("[server %v] Append from (%v, %v) directly.", rf.me, currentLogIndex, currentLogTerm)
+					log.Printf("[server %v] Append from (%v, %v) directly.",
+						rf.me, currentLogIndex, currentLogTerm)
 					rf.log = append(rf.log, para.args.Entries...)
 					para.reply.AppendSuccess = true
-					currentLogIndex, currentLogTerm = rf.getLastLogInfo()
 				}
 			} else {
 				if currentLogIndex > para.args.PrevLogIndex {
@@ -617,7 +621,8 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 					}
 
 					if comparable {
-						log.Printf("[server %v] (%v, %v) same. then try to find truncate point", rf.me, para.args.PrevLogIndex, para.args.PrevLogTerm)
+						log.Printf("[server %v] (%v, %v) same. then try to find truncate point",
+							rf.me, para.args.PrevLogIndex, para.args.PrevLogTerm)
 						appendLen := len(para.args.Entries)
 						extendLen := len(rf.log[para.args.PrevLogIndex+1:])
 						base := para.args.PrevLogIndex + 1
@@ -642,13 +647,13 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 							rf.log = append(rf.log, appendEntries...)
 						}
 
-						currentLogIndex, currentLogTerm = rf.getLastLogInfo()
 						para.reply.LastLogTermFirstIndex = 0
 						para.reply.AppendSuccess = true
 					}
 				}
 			}
 
+			currentLogIndex, currentLogTerm = rf.getLastLogInfo()
 			para.reply.LastLogIndex = currentLogIndex
 			para.reply.LastLogTerm = currentLogTerm
 
@@ -656,11 +661,7 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 				log.Printf("[server %v] append fail.", rf.me)
 				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndex(currentLogIndex)
 			} else {
-				log.Printf("[server %v] append successfully and (may) update commit from %v to %v",
-					rf.me, rf.commitIndex, para.args.CommitIndex)
-				if para.args.CommitIndex > rf.commitIndex {
-					rf.commitIndex = para.args.CommitIndex
-				}
+
 			}
 		}
 	}
@@ -685,6 +686,7 @@ func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 	currentlen := len(rf.log)
 	next := rf.next[peerid]
 	match := rf.match[peerid]
+	args.CommitIndex = min(rf.commitIndex, match)
 	//log.Printf("[server %v] len: %v. For server %v: next - %v, match - %v",
 	//	rf.me, currentlen, peerid, next, match)
 
@@ -733,8 +735,9 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 					log.Printf("[server %v] server %v (before) match: %v, next: %v",
 						rf.me, peerid, rf.match[peerid], rf.next[peerid])
 
-					if rf.match[peerid] < replydetail.sendNext {
-						rf.match[peerid] = replydetail.sendNext - 1
+					if rf.match[peerid] < replydetail.updatedMatch {
+						rf.match[peerid] = replydetail.updatedMatch
+						rf.updateCommitIndex()
 					}
 					currentIndex, _ := rf.getLastLogInfo()
 					if reply.LastLogIndex >= currentIndex {
@@ -744,7 +747,6 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 					}
 					log.Printf("[server %v] server %v (after) match: %v, next: %v",
 						rf.me, peerid, rf.match[peerid], rf.next[peerid])
-					rf.updateCommitIndex()
 				}
 			} else {
 				rf.next[peerid] = reply.LastLogTermFirstIndex
@@ -760,13 +762,16 @@ func (rf *Raft) updateCommitIndex() {
 	}
 	sort.Sort(sorts)
 	mid := len(rf.peers) - rf.majority
-	commitPoint := rf.match[mid]
+	commitPoint := sorts[mid]
+	log.Printf("[server %v] sorted s: %v, mid: %v, commitPoint: %v", rf.me, sorts, mid, commitPoint)
+
 	if commitPoint != 0 {
 		commitPointTerm := rf.log[commitPoint].Term
+		log.Printf("[server %v] commit point term: %v", rf.me, commitPointTerm)
 		if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
 			// leader can only commit current term log
 			begin, end := rf.commitIndex, commitPoint
-			log.Printf("[server %v] commit index update from %v to %v", rf.me, begin, end)
+			log.Printf("[server %v] Commit index updated. From %v to %v", rf.me, begin, end)
 			rf.commitIndex = commitPoint
 		}
 	}
@@ -827,7 +832,7 @@ func (rf *Raft) handleClientAppendMsg(msg *ClientAppendRequest) {
 		reply.isLeader = true
 		rf.match[rf.me] += 1
 
-		rf.startAppendEntries()
+		//rf.startAppendEntries()
 	}
 
 	reply.index, reply.term = rf.getLastLogInfo()
