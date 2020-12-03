@@ -49,8 +49,8 @@ type ApplyMsg struct {
 }
 
 type Log struct {
-	term int
-	msg  ApplyMsg
+	Term int
+	Msg  ApplyMsg
 }
 
 // for routine to handle requestVote RPC
@@ -83,21 +83,28 @@ type NotifyMsg struct {
 	msg         interface{}
 }
 
-type AppendEntriesReplyWithId struct {
-	peerid int
-	reply  *AppendEntriesReply
+type AppendEntriesReplyDetail struct {
+	peerid   int
+	sendNext int
+	reply    *AppendEntriesReply
 }
+
+type SortSlice []int
+
+func (s SortSlice) Len() int           { return len(s) }
+func (s SortSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s SortSlice) Less(i, j int) bool { return s[i] < s[j] }
 
 type MsgType int
 
 const (
-	RequestVoteMsg 			MsgType = 0
-	AppendEntriesMsg 		MsgType = 1
-	RequestVoteReplyMsg 	MsgType = 2
-	AppendEntriesReplyMsg 	MsgType = 3
-	GetStatusMsg 			MsgType = 4
-	ClientAppendMsg 		MsgType = 5
-	TimerMsg 				MsgType = 6
+	RequestVoteMsg        MsgType = 0
+	AppendEntriesMsg      MsgType = 1
+	RequestVoteReplyMsg   MsgType = 2
+	AppendEntriesReplyMsg MsgType = 3
+	GetStatusMsg          MsgType = 4
+	ClientAppendMsg       MsgType = 5
+	TimerMsg              MsgType = 6
 )
 
 //
@@ -109,6 +116,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 
@@ -218,7 +226,7 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Heatbeat 	 bool
+	Heartbeat    bool
 	Term         int
 	Leaderid     int
 	PrevLogIndex int
@@ -294,7 +302,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	para.logCommand = command
 	para.replyCh = ch
 
-	rf.sendResultToRoutine(5, &para)
+	log.Printf("[server %d] receive command from client.", rf.me)
+	rf.sendResultToRoutine(ClientAppendMsg, &para)
 
 	status := <-ch
 
@@ -343,6 +352,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	// 2A
@@ -352,6 +362,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2B - all server
 	rf.commitIndex = 0
 	rf.appliedIndex = 0
+
+	// 2B - init Log
+	initLog := Log{}
+	initLog.Term = 0
+	initLog.Msg.CommandValid = true
+	initLog.Msg.CommandIndex = 0
+	rf.log = append(rf.log, initLog)
 
 	// 2B - leader
 	peerNum := len(rf.peers)
@@ -363,8 +380,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.majority = peerNum/2 + 1
 	rf.electionTimoutCounter = 0
 	rf.heartbeatTimoutCounter = 0
-	rf.electionTimout = 350
-	rf.heartbeatTimout = 200
+	rf.randTheTimeout(300)
+	rf.heartbeatTimout = 150
 	rf.notifyCh = make(chan NotifyMsg, 100)
 	rf.votingCounter = 0
 
@@ -378,6 +395,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) raftRoutine() {
 	go rf.raftTimer()
+	go rf.appliedLog()
 	for {
 		select {
 		case notify := <-rf.notifyCh:
@@ -403,11 +421,11 @@ func (rf *Raft) raftRoutine() {
 
 				case AppendEntriesReplyMsg: // handle the AppendEntries reply
 					{
-						reply := notify.msg.(*AppendEntriesReplyWithId)
+						reply := notify.msg.(*AppendEntriesReplyDetail)
 						rf.handleAppendEntriesReply(reply)
 					}
 
-				case GetStateMsg: // handle getStatus request
+				case GetStatusMsg: // handle getStatus request
 					{
 						//ch := make(chan Status)
 						replyCh := notify.msg.(chan Status)
@@ -416,7 +434,7 @@ func (rf *Raft) raftRoutine() {
 
 				case ClientAppendMsg: // handle append request from client
 					{
-						msg := notify.msg.(ClientAppendRequest)
+						msg := notify.msg.(*ClientAppendRequest)
 						rf.handleClientAppendMsg(msg)
 					}
 
@@ -425,16 +443,35 @@ func (rf *Raft) raftRoutine() {
 						reply := notify.msg.(int)
 						rf.handleTimerNotify(reply)
 					}
+				}
 			}
 		}
 	}
 }
 
-
 func (rf *Raft) raftTimer() {
 	for {
 		time.Sleep(10 * time.Millisecond)
 		rf.sendResultToRoutine(TimerMsg, 10)
+		if rf.killed() {
+			log.Printf("[server %v] timer stop", rf.me)
+			break
+		}
+	}
+}
+
+func (rf *Raft) appliedLog() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		currentCommitindex := rf.commitIndex
+		if rf.appliedIndex < currentCommitindex {
+			log.Printf("[server %d] applied index update from %v to %v",
+				rf.me, rf.appliedIndex, currentCommitindex)
+			for i := rf.appliedIndex + 1; i <= currentCommitindex; i++ {
+				rf.applyCh <- rf.log[i].Msg
+			}
+			rf.appliedIndex = currentCommitindex
+		}
 	}
 }
 
@@ -456,13 +493,13 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 
 	if (rf.term < para.args.Term) || (rf.term == para.args.Term && rf.votefor == -1) {
 		rf.becomeFollower(para.args.Term, -1)
-		log.Println("[server %v] Become follower because receive vote request from server %v in term %v", rf.me, rf.votefor, rf.term)
+		log.Printf("[server %v] Become follower because receive vote request from server %v in term %v", rf.me, para.args.Candidateid, rf.term)
 		currentIndex, currentTerm := rf.getLastLogInfo()
 		if currentTerm < para.args.LastLogTerm || (currentTerm == para.args.LastLogTerm && currentIndex <= para.args.LastLogIndex) {
 			rf.votefor = para.args.Candidateid
 			para.reply.GrantVote = true
 			para.reply.Term = para.args.Term
-			log.Println("[server %v] Vote for server %v in term %v", rf.me, rf.votefor, rf.term)
+			log.Printf("[server %v] Vote for server %v in term %v", rf.me, rf.votefor, rf.term)
 		}
 	}
 	para.replyCh <- para.reply
@@ -470,7 +507,7 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 
 func (rf *Raft) startRequestVote() {
 	rf.becomeCandidate()
-	log.Println("[server %v] election timeout. Begin request vote with term %v", rf.me, rf.term)
+	log.Printf("[server %v] election timeout. Begin request vote with term %v", rf.me, rf.term)
 
 	args := RequestVoteArgs{}
 	args.Term = rf.term
@@ -497,7 +534,7 @@ func (rf *Raft) sendPeerRequestVote(peerid int, args *RequestVoteArgs) {
 func (rf *Raft) handleRequestVoteReply(reply *RequestVoteReply) {
 	if rf.term < reply.Term {
 		rf.becomeFollower(reply.Term, -1)
-		log.Println("[server %v] become follower by receiving vote reply with term %v", rf.me, rf.term)
+		log.Printf("[server %v] become follower by receiving vote reply with term %v", rf.me, rf.term)
 	} else {
 		if reply.Term == rf.term && reply.GrantVote { // vote for me.current term
 			rf.votingCounter += 1
@@ -531,7 +568,6 @@ func (rf *Raft) startAppendEntries() {
 	}
 }
 
-
 func (rf *Raft) sendPeerAppendEntries(args *AppendEntriesArgs, peerid int) {
 	reply := AppendEntriesReply{}
 	ok := rf.peers[peerid].Call("Raft.AppendEntries", args, &reply)
@@ -539,10 +575,11 @@ func (rf *Raft) sendPeerAppendEntries(args *AppendEntriesArgs, peerid int) {
 		reply.AppendSuccess = false
 		reply.Term = -1
 	}
-	replyWithId := AppendEntriesReplyWithId{}
-	replyWithId.peerid = peerid
-	replyWithId.reply = &reply
-	rf.sendResultToRoutine(AppendEntriesReplyMsg, &replyWithId)
+	replyDetail := AppendEntriesReplyDetail{}
+	replyDetail.peerid = peerid
+	replyDetail.sendNext = args.PrevLogIndex + 1
+	replyDetail.reply = &reply
+	rf.sendResultToRoutine(AppendEntriesReplyMsg, &replyDetail)
 }
 
 func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
@@ -552,47 +589,63 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 	if rf.term <= para.args.Term {
 		rf.becomeFollower(para.args.Term, para.args.Leaderid)
 		para.reply.Term = rf.term
-		if para.args.Heatbeat {
+		if para.args.Heartbeat { // heartbeat
 			para.reply.AppendSuccess = true
-			para.reply.LastLogIndex = -2
+			para.reply.LastLogIndex = -1
 		} else { // appendEntries
 			currentLogIndex, currentLogTerm := rf.getLastLogInfo() // (-1, -1)
 
-			if currentLogIndex >= para.args.PrevLogIndex { 
-				if currentLogIndex == -1 {
-					// empty. append directly
+			if currentLogIndex == para.args.PrevLogIndex {
+				if currentLogTerm == para.args.PrevLogTerm {
+					// same. append directly
+					log.Printf("[server %v] Append from (%v, %v) directly.", rf.me, currentLogIndex, currentLogTerm)
 					rf.log = append(rf.log, para.args.Entries...)
 					para.reply.AppendSuccess = true
 					currentLogIndex, currentLogTerm = rf.getLastLogInfo()
-				} else {
-					// find the diffrent point
-					appendLen := len(para.args.Entries)
-					extendLen := len(rf.log[para.args.PrevLogIndex + 1:])
-					base := para.args.PrevLogIndex + 1
-
-					bound := min(appendLen, extendLen)
-					diff := false 
-										
-					for i := 0; i < bound; i++ {
-						aTerm := para.args.Entries[i].term
-						myTerm := rf.log[base + i].term
-						if aTerm != myTerm {
-							rf.log = rf.log[:base + i + 1]
-							rf.log = append(rf.log, para.args.Entries...)
-							diff = true
-							break
+				}
+			} else {
+				if currentLogIndex > para.args.PrevLogIndex {
+					comparable := false
+					if para.args.PrevLogIndex == 0 {
+						comparable = true
+					} else {
+						if rf.log[para.args.PrevLogIndex].Term == para.args.PrevLogTerm {
+							comparable = true
+						} else {
+							rf.log = rf.log[:para.args.PrevLogIndex]
 						}
 					}
 
-					if !diff && (appendLen > extendLen) {
-						appendEntries := para.args.Entries[buond:]
-						rf.log = append(rf.log, appendEntries...)
+					if comparable {
+						log.Printf("[server %v] (%v, %v) same. then try to find truncate point", rf.me, para.args.PrevLogIndex, para.args.PrevLogTerm)
+						appendLen := len(para.args.Entries)
+						extendLen := len(rf.log[para.args.PrevLogIndex+1:])
+						base := para.args.PrevLogIndex + 1
+
+						bound := min(appendLen, extendLen)
+						diff := false
+
+						for i := 0; i < bound; i++ {
+							aTerm := para.args.Entries[i].Term
+							myTerm := rf.log[base+i].Term
+							if aTerm != myTerm {
+								rf.log = rf.log[:base+i]
+								appendEntries := para.args.Entries[i:]
+								rf.log = append(rf.log, appendEntries...)
+								diff = true
+								break
+							}
+						}
+
+						if !diff && (appendLen > extendLen) {
+							appendEntries := para.args.Entries[bound:]
+							rf.log = append(rf.log, appendEntries...)
+						}
+
+						currentLogIndex, currentLogTerm = rf.getLastLogInfo()
+						para.reply.LastLogTermFirstIndex = 0
+						para.reply.AppendSuccess = true
 					}
-
-					currentLogIndex, currentLogTerm = rf.getLastLogInfo()
-					para.reply.LastLogTermFirstIndex = -1
-					para.reply.AppendSuccess = true
-
 				}
 			}
 
@@ -600,7 +653,14 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			para.reply.LastLogTerm = currentLogTerm
 
 			if !para.reply.AppendSuccess {
+				log.Printf("[server %v] append fail.", rf.me)
 				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndex(currentLogIndex)
+			} else {
+				log.Printf("[server %v] append successfully and (may) update commit from %v to %v",
+					rf.me, rf.commitIndex, para.args.CommitIndex)
+				if para.args.CommitIndex > rf.commitIndex {
+					rf.commitIndex = para.args.CommitIndex
+				}
 			}
 		}
 	}
@@ -608,41 +668,36 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 }
 
 func min(a int, b int) int {
-	if a >= b {
+	if a <= b {
 		return a
 	} else {
 		return b
 	}
 }
 
-
 func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 	args := AppendEntriesArgs{}
 	args.Term = rf.term
 	args.Leaderid = rf.me
 	args.CommitIndex = rf.commitIndex
-	args.Heatbeat = false
+	args.Heartbeat = false
 
 	currentlen := len(rf.log)
 	next := rf.next[peerid]
 	match := rf.match[peerid]
+	//log.Printf("[server %v] len: %v. For server %v: next - %v, match - %v",
+	//	rf.me, currentlen, peerid, next, match)
 
-	if next == 0 {
-		if currentlen == next {
-			args.Heatbeat = true
-		} else {
-			args.PrevLogIndex = -1
-			args.PrevLogTerm = -1
-			args.Entries = rf.log
-		}
+	if (next-1 == match) && (next == currentlen) {
+		args.Heartbeat = true
 	} else {
-		if (next - 1 == match) && (next == currentlen) {
-			args.Heatbeat = true
-		} else {
-			args.PrevLogIndex = next - 1
-			args.PrevLogTerm = rf.log[next-1].term
-			args.Entries = rf.log[next:]
-		}
+		args.PrevLogIndex = next - 1
+		args.PrevLogTerm = rf.log[next-1].Term
+		args.Entries = rf.log[next:]
+	}
+
+	if !args.Heartbeat {
+		log.Printf("[server %v] Entries from (%v, %v) send to server %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, peerid)
 	}
 
 	return &args
@@ -650,60 +705,70 @@ func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 
 func (rf *Raft) findTheFirstIndex(index int) int {
 	ret := index
-	if ret <= 0 {
-		currentLastTerm := rf.log[index].term
+	if ret == 0 {
+		return 1
+	} else {
+		currentLastTerm := rf.log[index].Term
 		for i := index - 1; i > 0; i-- {
-			if rf.log[i].term != currentLastTerm {
+			if rf.log[i].Term != currentLastTerm {
 				ret = i + 1
 				break
 			}
-		}		
+		}
 	}
 	return ret
 }
 
-func (rf *Raft) handleAppendEntriesReply(replywithid *AppendEntriesReplyWithId) {
-	reply := replywithid.reply
-	peerid := replywithid.peerid
+func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) {
+	reply := replydetail.reply
+	peerid := replydetail.peerid
 	if rf.term < reply.Term {
 		rf.becomeFollower(reply.Term, -1)
-		log.Println("[server %v] become follower by receiving append reply with term %v", rf.me, rf.term)
+		log.Printf("[server %v] become follower by receiving append reply with term %v", rf.me, rf.term)
 	} else {
 		// TODO: re-think about reply.
 		if rf.term == reply.Term {
-			if reply.AppendSuccess { 
-				if reply.LastLogIndex != -2  { // not a heartbeat reply 
-					rf.match[peerid] = rf.next[peerid]
+			if reply.AppendSuccess {
+				if reply.LastLogIndex != -1 { // not a heartbeat reply
+					log.Printf("[server %v] server %v (before) match: %v, next: %v",
+						rf.me, peerid, rf.match[peerid], rf.next[peerid])
+
+					if rf.match[peerid] < replydetail.sendNext {
+						rf.match[peerid] = replydetail.sendNext - 1
+					}
 					currentIndex, _ := rf.getLastLogInfo()
 					if reply.LastLogIndex >= currentIndex {
-						rf.next[peerid] = currentIndex + 1
+						rf.next[peerid] = currentIndex + 1 // len
 					} else {
 						rf.next[peerid] = reply.LastLogIndex + 1
 					}
+					log.Printf("[server %v] server %v (after) match: %v, next: %v",
+						rf.me, peerid, rf.match[peerid], rf.next[peerid])
 					rf.updateCommitIndex()
 				}
 			} else {
 				rf.next[peerid] = reply.LastLogTermFirstIndex
-				if rf.next[peerid] < 0 {
-					rf.next[peerid] = 0
-				}
 			}
 		}
 	}
 }
 
 func (rf *Raft) updateCommitIndex() {
-	sortslice := rf.match[:]
-	sort.Sort(sortslice)
-	commitPoint := len(rf.peers) - rf.majority
-	commitPointTerm := rf.log[commitPoint].term
-	if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
-		// leader can only commit current term log
-		rf.commitIndex = commitPoint
-		log.Printf("[server %v] commit index update to %v", rf.me, rf.commitIndex)
-		// TODO: append logical
-	} else {
-		// TODO:
+	var sorts SortSlice
+	for _, value := range rf.match {
+		sorts = append(sorts, value)
+	}
+	sort.Sort(sorts)
+	mid := len(rf.peers) - rf.majority
+	commitPoint := rf.match[mid]
+	if commitPoint != 0 {
+		commitPointTerm := rf.log[commitPoint].Term
+		if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
+			// leader can only commit current term log
+			begin, end := rf.commitIndex, commitPoint
+			log.Printf("[server %v] commit index update from %v to %v", rf.me, begin, end)
+			rf.commitIndex = commitPoint
+		}
 	}
 }
 
@@ -714,7 +779,7 @@ func (rf *Raft) handleTimerNotify(tick int) {
 	if rf.role == 2 {
 		// leader - send heartbeat or appendentries is timeout
 		// TODO: how to decide which msg leader should send
-		if rf.heartbeatTimoutCounter >= rf.heartbeatTimoutCounter {
+		if rf.heartbeatTimoutCounter >= rf.heartbeatTimout {
 			rf.startAppendEntries()
 		}
 	} else {
@@ -722,12 +787,16 @@ func (rf *Raft) handleTimerNotify(tick int) {
 		if rf.electionTimoutCounter >= rf.electionTimout {
 
 			rf.electionTimoutCounter = 0
-			r := rand.New(rand.NewSource(time.Now().UnixNano()))
-			rf.electionTimout = int(r.Int31n(150)) + 350
+			rf.randTheTimeout(150)
 
 			rf.startRequestVote()
 		}
 	}
+}
+
+func (rf *Raft) randTheTimeout(n int) {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rf.electionTimout = int(r.Int31n(150)) + n
 }
 
 func (rf *Raft) handleGetStatusRequest(replyCh chan Status) {
@@ -744,14 +813,15 @@ func (rf *Raft) handleGetStatusRequest(replyCh chan Status) {
 	replyCh <- reply
 }
 
-func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
+func (rf *Raft) handleClientAppendMsg(msg *ClientAppendRequest) {
 	reply := Status{}
 	reply.isLeader = false
 	if rf.role == 2 {
 		appendLog := Log{}
-		appendLog.term = rf.term
-		appendLog.msg.CommandValid = true
-		appendLog.msg.Command = msg.logCommand
+		appendLog.Term = rf.term
+		appendLog.Msg.CommandValid = true
+		appendLog.Msg.Command = msg.logCommand
+		appendLog.Msg.CommandIndex = len(rf.log)
 
 		rf.log = append(rf.log, appendLog)
 		reply.isLeader = true
@@ -768,13 +838,8 @@ func (rf *Raft) handleClientAppendMsg(msg ClientAppendRequest) {
 func (rf *Raft) getLastLogInfo() (int, int) {
 	var index, term int
 	loglen := len(rf.log)
-	if loglen == 0 {
-		index = -1
-		term = -1
-	} else {
-		index = loglen - 1
-		term = rf.log[index].term
-	}
+	index = loglen - 1
+	term = rf.log[index].Term
 
 	return index, term
 }
@@ -804,18 +869,15 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) becomeLeader() {
+	log.Printf("[server %v] Receive vote from majority and become leader.", rf.me)
 	rf.role = 2
 	rf.heartbeatTimoutCounter = 0
-	lastindex, _ := rf.getLastLogInfo()
+	loglen := len(rf.log)
 	for i, _ := range rf.peers {
 		rf.match[i] = 0
-		if lastindex == -1 {
-			rf.next[i] == 0
-		} else {
-			rf.next[i] = lastindex
-		}
+		rf.next[i] = loglen
 	}
-	rf.match[rf.me] = len(rf.log) - 1
-	
+	rf.match[rf.me] = loglen - 1
+
 	rf.startAppendEntries()
 }
