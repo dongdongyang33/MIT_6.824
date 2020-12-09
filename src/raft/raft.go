@@ -111,12 +111,13 @@ const (
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
-	applyCh   chan ApplyMsg
+	mu            sync.Mutex          // Lock to protect shared access to this peer's state
+	peers         []*labrpc.ClientEnd // RPC end points of all peers
+	persister     *Persister          // Object to hold this peer's persisted state
+	me            int                 // this peer's index into peers[]
+	dead          int32               // set by Kill()
+	applyCh       chan ApplyMsg
+	applyNotifyCh chan int
 
 	// Your data here (2A, 2B, 2C).
 
@@ -142,6 +143,8 @@ type Raft struct {
 	heartbeatTimoutCounter int
 	votingCounter          int
 	notifyCh               chan NotifyMsg
+	applyLog               []Log
+	applyNotify            sync.Cond
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -394,7 +397,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) raftRoutine() {
 	go rf.raftTimer()
-	go rf.appliedLog()
+	go rf.appliedLogRoutine()
 	for {
 		select {
 		case notify := <-rf.notifyCh:
@@ -459,21 +462,10 @@ func (rf *Raft) raftTimer() {
 	}
 }
 
-func (rf *Raft) appliedLog() {
-	for {
-		time.Sleep(5 * time.Millisecond)
-		currentCommitindex := rf.commitIndex
-		currentLogLen := len(rf.log) - 1
-		applyBound := min(currentCommitindex, currentLogLen)
-		if rf.appliedIndex < currentCommitindex {
-			log.Printf("[server %d] applied index update from %v to %v",
-				rf.me, rf.appliedIndex, applyBound)
-			for i := rf.appliedIndex + 1; i <= applyBound; i++ {
-				rf.applyCh <- rf.log[i].Msg
-			}
-			rf.appliedIndex = applyBound
-		}
-	}
+func (rf *Raft) appliedLogRoutine() {
+	// TODO:
+	// wait() if applyLog size == 0
+	// begin to apply if wake by signal()
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -590,9 +582,7 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 	if rf.term <= para.args.Term {
 		rf.becomeFollower(para.args.Term, para.args.Leaderid)
 		para.reply.Term = rf.term
-		if para.args.CommitIndex > rf.commitIndex {
-			rf.commitIndex = para.args.CommitIndex
-		}
+		rf.updateCommitIndex(para.args.CommitIndex)
 		if para.args.Heartbeat { // heartbeat
 			para.reply.AppendSuccess = true
 			para.reply.LastLogIndex = -1
@@ -737,7 +727,7 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 
 					if rf.match[peerid] < replydetail.updatedMatch {
 						rf.match[peerid] = replydetail.updatedMatch
-						rf.updateCommitIndex()
+						rf.updateCommitIndex(-1)
 					}
 					currentIndex, _ := rf.getLastLogInfo()
 					if reply.LastLogIndex >= currentIndex {
@@ -755,25 +745,41 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 	}
 }
 
-func (rf *Raft) updateCommitIndex() {
-	var sorts SortSlice
-	for _, value := range rf.match {
-		sorts = append(sorts, value)
-	}
-	sort.Sort(sorts)
-	mid := len(rf.peers) - rf.majority
-	commitPoint := sorts[mid]
-	log.Printf("[server %v] sorted s: %v, mid: %v, commitPoint: %v", rf.me, sorts, mid, commitPoint)
-
-	if commitPoint != 0 {
-		commitPointTerm := rf.log[commitPoint].Term
-		log.Printf("[server %v] commit point term: %v", rf.me, commitPointTerm)
-		if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
-			// leader can only commit current term log
-			begin, end := rf.commitIndex, commitPoint
-			log.Printf("[server %v] Commit index updated. From %v to %v", rf.me, begin, end)
-			rf.commitIndex = commitPoint
+func (rf *Raft) updateCommitIndex(updatecommit int) {
+	updated := false
+	oldcommit := rf.commitIndex
+	if updatecommit == -1 { // leader
+		var sorts SortSlice
+		for _, value := range rf.match {
+			sorts = append(sorts, value)
 		}
+		sort.Sort(sorts)
+		mid := len(rf.peers) - rf.majority
+		commitPoint := sorts[mid]
+		log.Printf("[server %v] sorted s: %v, mid: %v, commitPoint: %v", rf.me, sorts, mid, commitPoint)
+
+		if commitPoint != 0 {
+			commitPointTerm := rf.log[commitPoint].Term
+			log.Printf("[server %v] commit point term: %v", rf.me, commitPointTerm)
+			if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
+				// leader can only commit current term log
+				log.Printf("[server %v] Commit index updated. From %v to %v", rf.me, rf.commitIndex, commitPoint)
+				rf.commitIndex = commitPoint
+				updated = true
+			}
+		}
+	} else {
+		if rf.commitIndex < updatecommit {
+			log.Printf("[server %v] Commit index updated. From %v to %v", rf.me, rf.commitIndex, updatecommit)
+			rf.commitIndex = updatecommit
+			updated = true
+		}
+	}
+
+	if updated {
+		// TODO:
+		// append log[oldcommit : rf.commitIndex + 1] to applyLog[]
+		// and notify applyNotify(cv) after done
 	}
 }
 
