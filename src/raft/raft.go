@@ -144,7 +144,7 @@ type Raft struct {
 	votingCounter          int
 	notifyCh               chan NotifyMsg
 	applyLog               []Log
-	applyNotify            sync.Cond
+	applyNotify            *sync.Cond
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -386,6 +386,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTimout = 100
 	rf.notifyCh = make(chan NotifyMsg, 100)
 	rf.votingCounter = 0
+	rf.applyNotify = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -466,6 +467,18 @@ func (rf *Raft) appliedLogRoutine() {
 	// TODO:
 	// wait() if applyLog size == 0
 	// begin to apply if wake by signal()
+	for {
+		rf.applyNotify.L.Lock()
+		for len(rf.applyLog) == 0 {
+			rf.applyNotify.Wait()
+		}
+		al := rf.applyLog
+		rf.applyLog = nil
+		rf.applyNotify.L.Unlock()
+		for i, _ := range al {
+			rf.applyCh <- al[i].Msg
+		}
+	}
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -780,6 +793,12 @@ func (rf *Raft) updateCommitIndex(updatecommit int) {
 		// TODO:
 		// append log[oldcommit : rf.commitIndex + 1] to applyLog[]
 		// and notify applyNotify(cv) after done
+		appendPart := rf.log[oldcommit : rf.commitIndex + 1]
+
+		rf.applyNotify.L.Lock()
+		rf.applyLog = append(rf.applyLog, appendPart...)
+		rf.applyNotify.Signal()	
+		rf.applyNotify.L.Unlock()
 	}
 }
 
