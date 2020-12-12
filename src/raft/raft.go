@@ -93,7 +93,7 @@ type SortSlice []int
 
 func (s SortSlice) Len() int           { return len(s) }
 func (s SortSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-func (s SortSlice) Less(i, j int) bool { return s[i] < s[j] }
+func (s SortSlice) Less(i, j int) bool { return s[i] > s[j] }
 
 type MsgType int
 
@@ -472,7 +472,8 @@ func (rf *Raft) appliedLogRoutine() {
 		for len(rf.applyLog) == 0 {
 			rf.applyNotify.Wait()
 		}
-		al := rf.applyLog
+		var al []Log
+		al = append(al, rf.applyLog...)
 		rf.applyLog = nil
 		rf.applyNotify.L.Unlock()
 		for i, _ := range al {
@@ -499,10 +500,11 @@ func (rf *Raft) handleRequestVote(para *RequestVotePara) {
 
 	if (rf.term < para.args.Term) || (rf.term == para.args.Term && rf.votefor == -1) {
 		rf.becomeFollower(para.args.Term, -1)
-		log.Printf("[server %v] Become follower because receive vote request from server %v in term %v", rf.me, para.args.Candidateid, rf.term)
+		log.Printf("[server %v] Become follower because receive vote request from server %v in term %v",
+			rf.me, para.args.Candidateid, rf.term)
 		currentIndex, currentTerm := rf.getLastLogInfo()
 		if currentTerm < para.args.LastLogTerm || (currentTerm == para.args.LastLogTerm && currentIndex <= para.args.LastLogIndex) {
-			rf.votefor = para.args.Candidateid
+			rf.becomeFollower(para.args.Term, para.args.Candidateid)
 			para.reply.GrantVote = true
 			para.reply.Term = para.args.Term
 			log.Printf("[server %v] Vote for server %v in term %v", rf.me, rf.votefor, rf.term)
@@ -597,10 +599,12 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 		para.reply.Term = rf.term
 		rf.updateCommitIndex(para.args.CommitIndex)
 		if para.args.Heartbeat { // heartbeat
+			log.Printf("[server %v] Recive heartbeat from server %v.",
+				rf.me, para.args.Leaderid)
 			para.reply.AppendSuccess = true
 			para.reply.LastLogIndex = -1
 		} else { // appendEntries
-			currentLogIndex, currentLogTerm := rf.getLastLogInfo() // (-1, -1)
+			currentLogIndex, currentLogTerm := rf.getLastLogInfo()
 
 			if currentLogIndex == para.args.PrevLogIndex {
 				if currentLogTerm == para.args.PrevLogTerm {
@@ -613,22 +617,18 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			} else {
 				if currentLogIndex > para.args.PrevLogIndex {
 					comparable := false
-					if para.args.PrevLogIndex == 0 {
+					if rf.log[para.args.PrevLogIndex].Term == para.args.PrevLogTerm {
 						comparable = true
 					} else {
-						if rf.log[para.args.PrevLogIndex].Term == para.args.PrevLogTerm {
-							comparable = true
-						} else {
-							rf.log = rf.log[:para.args.PrevLogIndex]
-						}
+						rf.log = rf.log[:para.args.PrevLogIndex]
 					}
 
 					if comparable {
 						log.Printf("[server %v] (%v, %v) same. then try to find truncate point",
 							rf.me, para.args.PrevLogIndex, para.args.PrevLogTerm)
-						appendLen := len(para.args.Entries)
-						extendLen := len(rf.log[para.args.PrevLogIndex+1:])
 						base := para.args.PrevLogIndex + 1
+						appendLen := len(para.args.Entries)
+						extendLen := len(rf.log[base:])
 
 						bound := min(appendLen, extendLen)
 						diff := false
@@ -698,10 +698,7 @@ func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 	} else {
 		args.PrevLogIndex = next - 1
 		args.PrevLogTerm = rf.log[next-1].Term
-		args.Entries = rf.log[next:]
-	}
-
-	if !args.Heartbeat {
+		args.Entries = append(args.Entries, rf.log[next:]...)
 		log.Printf("[server %v] Entries from (%v, %v) send to server %d", rf.me, args.PrevLogIndex, args.PrevLogTerm, peerid)
 	}
 
@@ -714,7 +711,7 @@ func (rf *Raft) findTheFirstIndex(index int) int {
 		return 1
 	} else {
 		currentLastTerm := rf.log[index].Term
-		for i := index - 1; i > 0; i-- {
+		for i := index - 1; i >= 0; i-- {
 			if rf.log[i].Term != currentLastTerm {
 				ret = i + 1
 				break
@@ -735,9 +732,6 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 		if rf.term == reply.Term {
 			if reply.AppendSuccess {
 				if reply.LastLogIndex != -1 { // not a heartbeat reply
-					log.Printf("[server %v] server %v (before) match: %v, next: %v",
-						rf.me, peerid, rf.match[peerid], rf.next[peerid])
-
 					if rf.match[peerid] < replydetail.updatedMatch {
 						rf.match[peerid] = replydetail.updatedMatch
 						rf.updateCommitIndex(-1)
@@ -748,7 +742,7 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 					} else {
 						rf.next[peerid] = reply.LastLogIndex + 1
 					}
-					log.Printf("[server %v] server %v (after) match: %v, next: %v",
+					log.Printf("[server %v] update match and next for server %v - match: %v, next: %v",
 						rf.me, peerid, rf.match[peerid], rf.next[peerid])
 				}
 			} else {
@@ -767,23 +761,22 @@ func (rf *Raft) updateCommitIndex(updatecommit int) {
 			sorts = append(sorts, value)
 		}
 		sort.Sort(sorts)
-		mid := len(rf.peers) - rf.majority
-		commitPoint := sorts[mid]
-		log.Printf("[server %v] sorted s: %v, mid: %v, commitPoint: %v", rf.me, sorts, mid, commitPoint)
+		commitPoint := sorts[rf.majority-1]
+		log.Printf("[server %v] sorted s: %v, commitPoint: %v", rf.me, sorts, commitPoint)
 
 		if commitPoint != 0 {
 			commitPointTerm := rf.log[commitPoint].Term
 			log.Printf("[server %v] commit point term: %v", rf.me, commitPointTerm)
 			if (commitPointTerm == rf.term) && (rf.commitIndex < commitPoint) {
 				// leader can only commit current term log
-				log.Printf("[server %v] Commit index updated. From %v to %v", rf.me, rf.commitIndex, commitPoint)
+				log.Printf("[server %v] (leader) Commit index updated. From %v to %v", rf.me, rf.commitIndex, commitPoint)
 				rf.commitIndex = commitPoint
 				updated = true
 			}
 		}
 	} else {
 		if rf.commitIndex < updatecommit {
-			log.Printf("[server %v] Commit index updated. From %v to %v", rf.me, rf.commitIndex, updatecommit)
+			log.Printf("[server %v] (follower) Commit index updated. From %v to %v", rf.me, rf.commitIndex, updatecommit)
 			rf.commitIndex = updatecommit
 			updated = true
 		}
@@ -793,11 +786,11 @@ func (rf *Raft) updateCommitIndex(updatecommit int) {
 		// TODO:
 		// append log[oldcommit : rf.commitIndex + 1] to applyLog[]
 		// and notify applyNotify(cv) after done
-		appendPart := rf.log[oldcommit : rf.commitIndex + 1]
+		appendPart := rf.log[oldcommit : rf.commitIndex+1]
 
 		rf.applyNotify.L.Lock()
 		rf.applyLog = append(rf.applyLog, appendPart...)
-		rf.applyNotify.Signal()	
+		rf.applyNotify.Signal()
 		rf.applyNotify.L.Unlock()
 	}
 }
@@ -827,6 +820,7 @@ func (rf *Raft) handleTimerNotify(tick int) {
 func (rf *Raft) randTheTimeout(n int) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.electionTimout = int(r.Int31n(150)) + n
+	log.Printf("[server %v] rand election timeout to %v", rf.me, rf.electionTimout)
 }
 
 func (rf *Raft) handleGetStatusRequest(replyCh chan Status) {
@@ -883,11 +877,16 @@ func (rf *Raft) sendResultToRoutine(msgType MsgType, msg interface{}) {
 }
 
 func (rf *Raft) becomeFollower(receiveTerm int, receiveVotefor int) {
-	rf.role = 0
+	// need to persist
 	rf.term = receiveTerm
 	rf.votefor = receiveVotefor
+
+	// not need to persist
+	rf.role = 0
 	rf.votingCounter = 0
-	rf.electionTimoutCounter = 0
+	if receiveVotefor != -1 {
+		rf.electionTimoutCounter = 0
+	}
 }
 
 func (rf *Raft) becomeCandidate() {
