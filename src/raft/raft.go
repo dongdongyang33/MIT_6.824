@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"log"
 	"math/rand"
 	"sort"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -175,6 +177,14 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.votefor)
+	e.Encode(rf.log[1:])
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+
 	// Example:
 	// w := new(bytes.Buffer)
 	// e := labgob.NewEncoder(w)
@@ -204,6 +214,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term, votefor int
+	var lg []Log
+	if d.Decode(&term) != nil || d.Decode(&votefor) != nil || d.Decode(&lg) != nil {
+		log.Printf("[server %v] decode error!", rf.me)
+	} else {
+		rf.term = term
+		rf.votefor = votefor
+		rf.log = append(rf.log, lg...)
+		lastindex, lastterm := rf.getLastLogInfo()
+		log.Printf("[server %v] Read from persist successful! (term: %v, voetefor: %v, loglastIndex&term: %v-%v)",
+			rf.me, term, votefor, lastindex, lastterm)
+	}
 }
 
 //
@@ -593,6 +618,7 @@ func (rf *Raft) sendPeerAppendEntries(args *AppendEntriesArgs, peerid int) {
 func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 	para.reply.AppendSuccess = false
 	para.reply.Term = rf.term
+	para.reply.LastLogTermFirstIndex = 1
 
 	if rf.term <= para.args.Term {
 		rf.becomeFollower(para.args.Term, para.args.Leaderid)
@@ -613,6 +639,7 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 						rf.me, currentLogIndex, currentLogTerm)
 					rf.log = append(rf.log, para.args.Entries...)
 					para.reply.AppendSuccess = true
+
 				}
 			} else {
 				if currentLogIndex > para.args.PrevLogIndex {
@@ -661,10 +688,15 @@ func (rf *Raft) handleAppendEntries(para *AppendEntriesPara) {
 			para.reply.LastLogTerm = currentLogTerm
 
 			if !para.reply.AppendSuccess {
-				log.Printf("[server %v] append fail.", rf.me)
 				para.reply.LastLogTermFirstIndex = rf.findTheFirstIndex(currentLogIndex)
+				log.Printf("[server %v] Append fail. Last log term (%v) first index is %v",
+					rf.me, currentLogTerm, para.reply.LastLogTermFirstIndex)
 			} else {
-
+				if !para.args.Heartbeat {
+					rf.persist()
+					log.Printf("[server %v] Append Success. Persist latest log (%v-%v)",
+						rf.me, currentLogIndex, currentLogTerm)
+				}
 			}
 		}
 	}
@@ -690,8 +722,8 @@ func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 	next := rf.next[peerid]
 	match := rf.match[peerid]
 	args.CommitIndex = min(rf.commitIndex, match)
-	//log.Printf("[server %v] len: %v. For server %v: next - %v, match - %v",
-	//	rf.me, currentlen, peerid, next, match)
+	log.Printf("[server %v] len: %v. For server %v: next - %v, match - %v",
+		rf.me, currentlen, peerid, next, match)
 
 	if (next-1 == match) && (next == currentlen) {
 		args.Heartbeat = true
@@ -707,7 +739,7 @@ func (rf *Raft) generateAppendArgs(peerid int) *AppendEntriesArgs {
 
 func (rf *Raft) findTheFirstIndex(index int) int {
 	ret := index
-	if ret == 0 {
+	if ret <= 1 {
 		return 1
 	} else {
 		currentLastTerm := rf.log[index].Term
@@ -747,6 +779,8 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 				}
 			} else {
 				rf.next[peerid] = reply.LastLogTermFirstIndex
+				log.Printf("[server %v] Append fail! update match and next for server %v - match: %v, next: %v",
+					rf.me, peerid, rf.match[peerid], rf.next[peerid])
 			}
 		}
 	}
@@ -848,6 +882,7 @@ func (rf *Raft) handleClientAppendMsg(msg *ClientAppendRequest) {
 		appendLog.Msg.CommandIndex = len(rf.log)
 
 		rf.log = append(rf.log, appendLog)
+		rf.persist()
 		reply.isLeader = true
 		rf.match[rf.me] += 1
 
@@ -880,6 +915,7 @@ func (rf *Raft) becomeFollower(receiveTerm int, receiveVotefor int) {
 	// need to persist
 	rf.term = receiveTerm
 	rf.votefor = receiveVotefor
+	rf.persist()
 
 	// not need to persist
 	rf.role = 0
@@ -890,9 +926,11 @@ func (rf *Raft) becomeFollower(receiveTerm int, receiveVotefor int) {
 }
 
 func (rf *Raft) becomeCandidate() {
-	rf.role = 1
 	rf.term += 1
 	rf.votefor = rf.me
+	rf.persist()
+
+	rf.role = 1
 	rf.votingCounter = 1
 	rf.electionTimoutCounter = 0
 }
