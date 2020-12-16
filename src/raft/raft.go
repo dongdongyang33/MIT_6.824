@@ -912,14 +912,15 @@ func (rf *Raft) sendResultToRoutine(msgType MsgType, msg interface{}) {
 }
 
 func (rf *Raft) becomeFollower(receiveTerm int, receiveVotefor int) {
-	// need to persist
-	rf.term = receiveTerm
-	rf.votefor = receiveVotefor
-	rf.persist()
+	if (receiveTerm != rf.term) || receiveVotefor != rf.votefor {
+		rf.term = receiveTerm
+		rf.votefor = receiveVotefor
+		rf.persist()
 
-	// not need to persist
-	rf.role = 0
-	rf.votingCounter = 0
+		rf.role = 0
+		rf.votingCounter = 0
+	}
+
 	if receiveVotefor != -1 {
 		rf.electionTimoutCounter = 0
 	}
