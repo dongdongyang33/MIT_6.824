@@ -46,6 +46,7 @@ import (
 //
 type ApplyMsg struct {
 	CommandValid bool
+	CommandTerm  int
 	CommandIndex int
 	Command      interface{}
 }
@@ -395,6 +396,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	initLog.Term = 0
 	initLog.Msg.CommandValid = true
 	initLog.Msg.CommandIndex = 0
+	initLog.Msg.CommandTerm = 0
 	rf.log = append(rf.log, initLog)
 
 	// 2B - leader
@@ -407,7 +409,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.majority = peerNum/2 + 1
 	rf.electionTimoutCounter = 0
 	rf.heartbeatTimoutCounter = 0
-	rf.randTheTimeout(150)
+	rf.randTheTimeout(200)
 	rf.heartbeatTimout = 100
 	rf.notifyCh = make(chan NotifyMsg, 100)
 	rf.votingCounter = 0
@@ -761,7 +763,7 @@ func (rf *Raft) handleAppendEntriesReply(replydetail *AppendEntriesReplyDetail) 
 		log.Printf("[server %v] become follower by receiving append reply with term %v", rf.me, rf.term)
 	} else {
 		// TODO: re-think about reply.
-		if rf.term == reply.Term {
+		if rf.term == reply.Term && rf.role == 2 {
 			if reply.AppendSuccess {
 				if reply.LastLogIndex != -1 { // not a heartbeat reply
 					if rf.match[peerid] < replydetail.updatedMatch {
@@ -820,8 +822,7 @@ func (rf *Raft) updateCommitIndex(updatecommit int) {
 		// TODO:
 		// append log[oldcommit : rf.commitIndex + 1] to applyLog[]
 		// and notify applyNotify(cv) after done
-		appendPart := rf.log[oldcommit : rf.commitIndex+1]
-
+		appendPart := rf.log[oldcommit+1 : rf.commitIndex+1]
 		rf.applyNotify.L.Lock()
 		rf.applyLog = append(rf.applyLog, appendPart...)
 		rf.applyNotify.Signal()
@@ -844,7 +845,7 @@ func (rf *Raft) handleTimerNotify(tick int) {
 		if rf.electionTimoutCounter >= rf.electionTimout {
 
 			rf.electionTimoutCounter = 0
-			rf.randTheTimeout(150)
+			rf.randTheTimeout(200)
 
 			rf.startRequestVote()
 		}
@@ -853,7 +854,7 @@ func (rf *Raft) handleTimerNotify(tick int) {
 
 func (rf *Raft) randTheTimeout(n int) {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rf.electionTimout = int(r.Int31n(150)) + n
+	rf.electionTimout = int(r.Int31n(200)) + n
 	log.Printf("[server %v] rand election timeout to %v", rf.me, rf.electionTimout)
 }
 
@@ -880,6 +881,7 @@ func (rf *Raft) handleClientAppendMsg(msg *ClientAppendRequest) {
 		appendLog.Msg.CommandValid = true
 		appendLog.Msg.Command = msg.logCommand
 		appendLog.Msg.CommandIndex = len(rf.log)
+		appendLog.Msg.CommandTerm = rf.term
 
 		rf.log = append(rf.log, appendLog)
 		rf.persist()
